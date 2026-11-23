@@ -17,4 +17,25 @@ public class InGameHudMixin {
             ci.cancel();
         }
     }
+
+    @Inject(method = "renderHotbar", at = @At("HEAD"), cancellable = true)
+    private void bazarmod$hideHotbarDuringBattle(DrawContext context, RenderTickCounter tickCounter, CallbackInfo ci) {
+        if (BazarModClient.isBattleHudActive()) {
+            ci.cancel();
+        }
+    }
+
+    @Inject(method = "renderStatusBars", at = @At("HEAD"), cancellable = true)
+    private void bazarmod$hideStatusBarsDuringBattle(DrawContext context, CallbackInfo ci) {
+        if (BazarModClient.isBattleHudActive()) {
+            ci.cancel();
+        }
+    }
+
+    @Inject(method = "renderExperienceBar", at = @At("HEAD"), cancellable = true)
+    private void bazarmod$hideExpBarDuringBattle(DrawContext context, int x, CallbackInfo ci) {
+        if (BazarModClient.isBattleHudActive()) {
+            ci.cancel();
+        }
+    }
 }

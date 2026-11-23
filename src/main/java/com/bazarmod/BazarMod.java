@@ -3,6 +3,7 @@ package com.bazarmod;
 import com.mojang.brigadier.CommandDispatcher;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
+import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.event.player.AttackEntityCallback;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
@@ -38,6 +39,7 @@ import net.minecraft.util.Identifier;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.GameRules;
 import net.minecraft.world.Heightmap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -54,6 +56,9 @@ public class BazarMod implements ModInitializer {
 
     private static final Map<UUID, ShowdownSession> ACTIVE_SHOWDOWNS = new ConcurrentHashMap<>();
     private static final Map<UUID, Long> IMMUNE_UNTIL_TICK = new ConcurrentHashMap<>();
+
+    // Track original daylight cycle rule so we can cleanly freeze and restore time
+    private static Boolean savedDaylightCycleRule = null;
 
     private static final List<String> SPECTATOR_NAMES = List.of(
             "§6Смотрящий",
@@ -80,6 +85,9 @@ public class BazarMod implements ModInitializer {
         public final int effectiveWinThreshold;
         public final long createdTick;
         public final List<UUID> spectatorIds = new ArrayList<>();
+        // Map of frozen bystander mob UUID -> original aiDisabled state
+        public final Map<UUID, Boolean> frozenBystanders = new ConcurrentHashMap<>();
+        public boolean targetOriginalAiDisabled = false;
         public boolean evaluating = false;
 
         public ShowdownSession(UUID primaryPlayerId, LivingEntity target, BazarDictionary.PromptBundle bundle, int effectiveWinThreshold, long createdTick) {
@@ -95,6 +103,9 @@ public class BazarMod implements ModInitializer {
             this.promptWords = bundle.words();
             this.effectiveWinThreshold = effectiveWinThreshold;
             this.createdTick = createdTick;
+            if (target instanceof MobEntity mob) {
+                this.targetOriginalAiDisabled = mob.isAiDisabled();
+            }
         }
     }
 
@@ -105,6 +116,17 @@ public class BazarMod implements ModInitializer {
         BazarDictionary.ensureLoaded();
         BazarProgressionManager.ensureLoaded();
         BazarNetworking.registerPayloads();
+
+        // Full damage immunity for players and combatants during an active showdown!
+        ServerLivingEntityEvents.ALLOW_DAMAGE.register((entity, source, amount) -> {
+            if (entity instanceof PlayerEntity player && isPlayerInShowdown(player.getUuid())) {
+                return false;
+            }
+            if (isMobInShowdown(entity.getUuid()) || isSpectatorEntity(entity.getUuid())) {
+                return false;
+            }
+            return true;
+        });
 
         // Intercept mob attacks to launch a street showdown
         AttackEntityCallback.EVENT.register((player, world, hand, entity, hitResult) -> {
@@ -118,7 +140,6 @@ public class BazarMod implements ModInitializer {
                 return ActionResult.PASS;
             }
 
-            // Do not allow hitting spectators during a battle
             if (isSpectatorEntity(target.getUuid())) {
                 return ActionResult.FAIL;
             }
@@ -256,7 +277,7 @@ public class BazarMod implements ModInitializer {
             });
         });
 
-        // Keep combatants & spectators frozen and looking at the center of the battle!
+        // Keep time frozen, combatants & surrounding mobs frozen, and spectators watching!
         ServerTickEvents.END_SERVER_TICK.register(server -> {
             long now = server.getOverworld().getTime();
             Iterator<Map.Entry<UUID, ShowdownSession>> it = ACTIVE_SHOWDOWNS.entrySet().iterator();
@@ -265,28 +286,45 @@ public class BazarMod implements ModInitializer {
                 ServerPlayerEntity player = server.getPlayerManager().getPlayer(session.primaryPlayerId);
                 if (player == null || now - session.createdTick > 20L * 65) {
                     if (player != null) {
-                        despawnSpectators(player.getServerWorld(), session);
+                        cleanupSessionEntities(player.getServerWorld(), session);
                     }
                     it.remove();
+                    restoreWorldTimeIfIdle(server);
                     continue;
                 }
 
                 ServerWorld world = player.getServerWorld();
                 Vec3d midPoint = player.getEyePos();
 
+                // Freeze target mob completely
                 if (world.getEntity(session.targetMobId) instanceof LivingEntity mob && mob.isAlive()) {
+                    if (mob instanceof MobEntity mobEnt) {
+                        mobEnt.setAiDisabled(true);
+                        mobEnt.setTarget(null);
+                    }
+                    mob.setVelocity(Vec3d.ZERO);
                     mob.addStatusEffect(new StatusEffectInstance(StatusEffects.SLOWNESS, 10, 255, false, false));
                     mob.addStatusEffect(new StatusEffectInstance(StatusEffects.RESISTANCE, 10, 255, false, false));
                     mob.lookAt(EntityAnchorArgumentType.EntityAnchor.EYES, player.getEyePos());
                     midPoint = player.getEyePos().add(mob.getEyePos()).multiply(0.5);
                 }
 
+                // Freeze any nearby mobs within 40 blocks so nobody interferes or hits the player!
+                Box freezeBox = player.getBoundingBox().expand(40.0);
+                List<MobEntity> nearbyMobs = world.getEntitiesByClass(MobEntity.class, freezeBox,
+                        m -> m.isAlive() && !m.getUuid().equals(session.targetMobId) && !session.spectatorIds.contains(m.getUuid()));
+                for (MobEntity bystander : nearbyMobs) {
+                    session.frozenBystanders.putIfAbsent(bystander.getUuid(), bystander.isAiDisabled());
+                    bystander.setAiDisabled(true);
+                    bystander.setTarget(null);
+                    bystander.setVelocity(Vec3d.ZERO);
+                }
+
                 // Keep spectators watching the showdown
                 for (UUID specId : session.spectatorIds) {
                     Entity spec = world.getEntity(specId);
                     if (spec instanceof LivingEntity livingSpec && livingSpec.isAlive()) {
-                        livingSpec.addStatusEffect(new StatusEffectInstance(StatusEffects.SLOWNESS, 10, 255, false, false));
-                        livingSpec.addStatusEffect(new StatusEffectInstance(StatusEffects.RESISTANCE, 10, 255, false, false));
+                        livingSpec.setVelocity(Vec3d.ZERO);
                         livingSpec.lookAt(EntityAnchorArgumentType.EntityAnchor.EYES, midPoint);
                     }
                 }
@@ -295,6 +333,21 @@ public class BazarMod implements ModInitializer {
 
         // Commands: /bazar test, /bazar config, /bazar history, /bazar rank, /bazar reload
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> registerCommands(dispatcher));
+    }
+
+    private void freezeWorldTime(MinecraftServer server) {
+        GameRules.BooleanRule rule = server.getGameRules().get(GameRules.DO_DAYLIGHT_CYCLE);
+        if (savedDaylightCycleRule == null) {
+            savedDaylightCycleRule = rule.get();
+        }
+        rule.set(false, server);
+    }
+
+    private void restoreWorldTimeIfIdle(MinecraftServer server) {
+        if (ACTIVE_SHOWDOWNS.isEmpty() && savedDaylightCycleRule != null) {
+            server.getGameRules().get(GameRules.DO_DAYLIGHT_CYCLE).set(savedDaylightCycleRule, server);
+            savedDaylightCycleRule = null;
+        }
     }
 
     private void registerCommands(CommandDispatcher<ServerCommandSource> dispatcher) {
@@ -352,6 +405,7 @@ public class BazarMod implements ModInitializer {
     private void startShowdown(ServerPlayerEntity player, LivingEntity target) {
         BazarConfig cfg = BazarConfig.get();
         ServerWorld world = player.getServerWorld();
+        MinecraftServer server = world.getServer();
 
         String mobKey = Registries.ENTITY_TYPE.getId(target.getType()).getPath();
         int curWins = BazarProgressionManager.getMobWins(player.getUuid(), mobKey);
@@ -363,7 +417,15 @@ public class BazarMod implements ModInitializer {
         ShowdownSession session = new ShowdownSession(player.getUuid(), target, bundle, effectiveThreshold, world.getTime());
         ACTIVE_SHOWDOWNS.put(session.id, session);
 
-        int freezeTicks = (cfg.battleDurationSec + 15) * 20;
+        // Freeze world time!
+        freezeWorldTime(server);
+
+        int freezeTicks = (cfg.battleDurationSec + 20) * 20;
+        if (target instanceof MobEntity mobEnt) {
+            mobEnt.setAiDisabled(true);
+            mobEnt.setTarget(null);
+        }
+        target.setVelocity(Vec3d.ZERO);
         target.addStatusEffect(new StatusEffectInstance(StatusEffects.SLOWNESS, freezeTicks, 255, false, false));
         target.addStatusEffect(new StatusEffectInstance(StatusEffects.RESISTANCE, freezeTicks, 255, false, false));
         world.spawnParticles(ParticleTypes.CAMPFIRE_COSY_SMOKE, target.getX(), target.getY() + 1.0, target.getZ(), 30, 0.8, 0.5, 0.8, 0.02);
@@ -411,10 +473,8 @@ public class BazarMod implements ModInitializer {
             dir = player.getRotationVec(1.0f);
         }
         dir = new Vec3d(dir.x, 0, dir.z).normalize();
-        // Perpendicular vector (left & right sides of the duel!)
         Vec3d side = new Vec3d(-dir.z, 0, dir.x);
 
-        // 4 positions: 2 on the left side, 2 on the right side
         Vec3d[] offsets = new Vec3d[] {
                 mid.add(side.multiply(2.8)).add(dir.multiply(-0.8)),
                 mid.add(side.multiply(3.2)).add(dir.multiply(0.9)),
@@ -446,7 +506,8 @@ public class BazarMod implements ModInitializer {
         }
     }
 
-    private void despawnSpectators(ServerWorld world, ShowdownSession session) {
+    private void cleanupSessionEntities(ServerWorld world, ShowdownSession session) {
+        // Despawn spectators
         for (UUID specId : session.spectatorIds) {
             Entity spec = world.getEntity(specId);
             if (spec != null) {
@@ -455,22 +516,38 @@ public class BazarMod implements ModInitializer {
             }
         }
         session.spectatorIds.clear();
+
+        // Unfreeze all bystander mobs
+        for (Map.Entry<UUID, Boolean> entry : session.frozenBystanders.entrySet()) {
+            Entity ent = world.getEntity(entry.getKey());
+            if (ent instanceof MobEntity mob && mob.isAlive()) {
+                mob.setAiDisabled(entry.getValue());
+            }
+        }
+        session.frozenBystanders.clear();
+
+        // Unfreeze target mob
+        if (world.getEntity(session.targetMobId) instanceof LivingEntity mob && mob.isAlive()) {
+            if (mob instanceof MobEntity mobEnt) {
+                mobEnt.setAiDisabled(session.targetOriginalAiDisabled);
+            }
+            mob.removeStatusEffect(StatusEffects.SLOWNESS);
+            mob.removeStatusEffect(StatusEffects.RESISTANCE);
+        }
     }
 
     private void finishShowdown(MinecraftServer server, ShowdownSession session, GeminiJudgeClient.JudgeVerdict verdict) {
         ACTIVE_SHOWDOWNS.remove(session.id);
+        restoreWorldTimeIfIdle(server);
 
         ServerPlayerEntity player = server.getPlayerManager().getPlayer(session.primaryPlayerId);
         if (player == null) return;
 
         ServerWorld world = player.getServerWorld();
-        despawnSpectators(world, session);
+        cleanupSessionEntities(world, session);
 
         LivingEntity mob = (world.getEntity(session.targetMobId) instanceof LivingEntity le && le.isAlive()) ? le : null;
-
         if (mob != null) {
-            mob.removeStatusEffect(StatusEffects.SLOWNESS);
-            mob.removeStatusEffect(StatusEffects.RESISTANCE);
             IMMUNE_UNTIL_TICK.put(mob.getUuid(), world.getTime() + 100L);
         }
 
