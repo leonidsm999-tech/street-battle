@@ -308,6 +308,7 @@ public class BazarMod implements ModInitializer {
 
         // Keep time frozen, combatants & surrounding mobs frozen, and spectators watching!
         ServerTickEvents.END_SERVER_TICK.register(server -> {
+            BazarStructures.tickMainThread(server);
             long now = server.getOverworld().getTime();
             Iterator<Map.Entry<UUID, ShowdownSession>> it = ACTIVE_SHOWDOWNS.entrySet().iterator();
             while (it.hasNext()) {
@@ -428,11 +429,7 @@ public class BazarMod implements ModInitializer {
                                             player.getY(),
                                             player.getZ() + look.z * 6.0
                                     );
-                                    BlockBox bounds = new BlockBox(
-                                            origin.getX() - 8, origin.getY() - 8, origin.getZ() - 8,
-                                            origin.getX() + 8, origin.getY() + 10, origin.getZ() + 8
-                                    );
-                                    BazarStructures.buildSpotAt(world, bounds, origin, kind, world.getRandom());
+                                    BazarStructures.buildSpotImmediate(world, origin, kind);
                                     player.sendMessage(Text.literal("🏗 Постройка [" + kind + "] заспавнена рядом! Подойди к хозяину точки и ударь его для стрелки.")
                                             .formatted(Formatting.GREEN), false);
                                     return 1;

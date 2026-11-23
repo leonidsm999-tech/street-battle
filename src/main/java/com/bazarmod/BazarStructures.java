@@ -10,9 +10,7 @@ import net.minecraft.component.DataComponentTypes;
 import net.minecraft.component.type.DyedColorComponent;
 import net.minecraft.entity.EntityType;
 import net.minecraft.entity.EquipmentSlot;
-import net.minecraft.entity.SpawnReason;
 import net.minecraft.entity.attribute.EntityAttributes;
-import net.minecraft.entity.mob.MobEntity;
 import net.minecraft.entity.mob.PillagerEntity;
 import net.minecraft.entity.mob.ZombieEntity;
 import net.minecraft.entity.mob.ZombieVillagerEntity;
@@ -23,6 +21,7 @@ import net.minecraft.registry.Registries;
 import net.minecraft.registry.Registry;
 import net.minecraft.registry.RegistryKey;
 import net.minecraft.registry.RegistryKeys;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.structure.StructureContext;
 import net.minecraft.structure.StructurePiece;
@@ -39,12 +38,17 @@ import net.minecraft.util.math.random.Random;
 import net.minecraft.world.Heightmap;
 import net.minecraft.world.ServerWorldAccess;
 import net.minecraft.world.StructureWorldAccess;
+import net.minecraft.world.World;
 import net.minecraft.world.gen.StructureAccessor;
 import net.minecraft.world.gen.chunk.ChunkGenerator;
 import net.minecraft.world.gen.structure.Structure;
 import net.minecraft.world.gen.structure.StructureType;
 
+import java.util.Iterator;
+import java.util.List;
 import java.util.Optional;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
 public class BazarStructures {
     public static final String SPOT_PADIK = "padik";
@@ -55,6 +59,15 @@ public class BazarStructures {
     public static StructureType<BazarSpotStructure> KIOSK_TYPE;
     public static StructureType<BazarSpotStructure> GARAGE_TYPE;
     public static StructurePieceType SPOT_PIECE_TYPE;
+
+    private record DeferredSpotSetup(
+            RegistryKey<World> dimension,
+            BlockPos origin,
+            String spotKind,
+            int retriesLeft
+    ) {}
+
+    private static final Queue<DeferredSpotSetup> DEFERRED_SETUPS = new ConcurrentLinkedQueue<>();
 
     public static void register() {
         SPOT_PIECE_TYPE = Registry.register(
@@ -80,6 +93,34 @@ public class BazarStructures {
                 Identifier.of(BazarMod.MOD_ID, SPOT_GARAGE),
                 () -> BazarSpotStructure.GARAGE_CODEC
         );
+    }
+
+    /**
+     * Executed safely on the main server thread every tick to finalize entities, signs, and chest loot
+     * for newly generated structures without blocking or crashing worldgen worker threads.
+     */
+    public static void tickMainThread(MinecraftServer server) {
+        if (DEFERRED_SETUPS.isEmpty()) return;
+
+        int processed = 0;
+        Iterator<DeferredSpotSetup> it = DEFERRED_SETUPS.iterator();
+        while (it.hasNext() && processed < 4) {
+            DeferredSpotSetup task = it.next();
+            it.remove();
+            processed++;
+
+            ServerWorld world = server.getWorld(task.dimension());
+            if (world == null) continue;
+
+            if (!world.isChunkLoaded(task.origin())) {
+                if (task.retriesLeft() > 0) {
+                    DEFERRED_SETUPS.add(new DeferredSpotSetup(task.dimension(), task.origin(), task.spotKind(), task.retriesLeft() - 1));
+                }
+                continue;
+            }
+
+            finalizeSpotOnMainThread(world, task.origin(), task.spotKind());
+        }
     }
 
     public static class BazarSpotStructure extends Structure {
@@ -146,26 +187,42 @@ public class BazarStructures {
         @Override
         public void generate(StructureWorldAccess world, StructureAccessor structureAccessor, ChunkGenerator chunkGenerator,
                              Random random, BlockBox chunkBox, ChunkPos chunkPos, BlockPos pivot) {
-            buildSpotAt(world, chunkBox, origin, spotKind, random);
+            // 1. Place pure blocks safely in ChunkRegion
+            placeSpotBlocks(world, chunkBox, origin, spotKind);
+
+            // 2. When the center block of the spot is inside this chunkBox, defer entity/sign/chest setup to main thread!
+            if (chunkBox.contains(origin)) {
+                RegistryKey<World> dim = world.toServerWorld().getRegistryKey();
+                DEFERRED_SETUPS.add(new DeferredSpotSetup(dim, origin, spotKind, 200));
+            }
         }
     }
 
     /**
-     * Builds the chosen structure (padik, beer_kiosk, or garage) either during worldgen or via /bazar spot.
+     * Immediate spawn helper for `/bazar spot <type>` (already runs on the main server thread).
      */
-    public static void buildSpotAt(ServerWorldAccess world, BlockBox bounds, BlockPos origin, String spotKind, Random random) {
+    public static void buildSpotImmediate(ServerWorld world, BlockPos origin, String spotKind) {
+        BlockBox bounds = new BlockBox(
+                origin.getX() - 8, origin.getY() - 8, origin.getZ() - 8,
+                origin.getX() + 8, origin.getY() + 10, origin.getZ() + 8
+        );
+        placeSpotBlocks(world, bounds, origin, spotKind);
+        finalizeSpotOnMainThread(world, origin, spotKind);
+    }
+
+    private static void placeSpotBlocks(ServerWorldAccess world, BlockBox bounds, BlockPos origin, String spotKind) {
         switch (spotKind) {
-            case SPOT_PADIK -> buildPadik(world, bounds, origin, random);
-            case SPOT_KIOSK -> buildBeerKiosk(world, bounds, origin, random);
-            case SPOT_GARAGE -> buildGarage(world, bounds, origin, random);
+            case SPOT_PADIK -> placePadikBlocks(world, bounds, origin);
+            case SPOT_KIOSK -> placeBeerKioskBlocks(world, bounds, origin);
+            case SPOT_GARAGE -> placeGarageBlocks(world, bounds, origin);
         }
     }
 
     // =========================================================================
-    // 1. ПАДИК (Подъезд хрущёвки + лавочка + Старший по падику)
+    // BLOCK PLACEMENT ONLY (100% Thread-Safe for ChunkRegion & ServerWorld)
     // =========================================================================
-    private static void buildPadik(ServerWorldAccess world, BlockBox bounds, BlockPos origin, Random random) {
-        // Foundation & courtyard asphalt (7x8 area)
+
+    private static void placePadikBlocks(ServerWorldAccess world, BlockBox bounds, BlockPos origin) {
         for (int dx = -3; dx <= 3; dx++) {
             for (int dz = -4; dz <= 3; dz++) {
                 fillColumnDown(world, bounds, origin.add(dx, -1, dz), Blocks.SMOOTH_STONE.getDefaultState());
@@ -175,7 +232,6 @@ public class BazarStructures {
             }
         }
 
-        // Brick Khrushchyovka facade & stairwell (z from -4 to -1, x from -3 to 3, height 5)
         for (int y = 0; y <= 4; y++) {
             for (int dx = -3; dx <= 3; dx++) {
                 for (int dz = -4; dz <= -1; dz++) {
@@ -187,7 +243,7 @@ public class BazarStructures {
                 }
             }
         }
-        // Concrete Roof + Porch Awning (Козырёк над подъездом)
+
         for (int dx = -3; dx <= 3; dx++) {
             for (int dz = -4; dz <= 0; dz++) {
                 setBlock(world, bounds, origin.add(dx, 5, dz), Blocks.GRAY_CONCRETE.getDefaultState());
@@ -197,52 +253,22 @@ public class BazarStructures {
             setBlock(world, bounds, origin.add(dx, 3, 0), Blocks.SMOOTH_STONE_SLAB.getDefaultState());
         }
 
-        // Entrance doorway (open archway at x=0, z=-1, y=0..1) + Lantern
         setBlock(world, bounds, origin.add(0, 0, -1), Blocks.AIR.getDefaultState());
         setBlock(world, bounds, origin.add(0, 1, -1), Blocks.AIR.getDefaultState());
         setBlock(world, bounds, origin.add(0, 2, 0), Blocks.LANTERN.getDefaultState().with(LanternBlock.HANGING, true));
 
-        // Interior stairs & loot chest ("Общак в подъезде")
         setBlock(world, bounds, origin.add(-2, 0, -3), Blocks.STONE_BRICK_STAIRS.getDefaultState().with(StairsBlock.FACING, Direction.NORTH));
         setBlock(world, bounds, origin.add(-2, 1, -4), Blocks.STONE_BRICKS.getDefaultState());
-        placeLootChest(world, bounds, origin.add(2, 0, -3), Direction.SOUTH, "chests/padik", random);
+        setBlock(world, bounds, origin.add(2, 0, -3), Blocks.CHEST.getDefaultState().with(ChestBlock.FACING, Direction.SOUTH));
 
-        // Wooden Bench (Лавочка у падика) & Trash Can (Урна)
         setBlock(world, bounds, origin.add(-2, 0, 1), Blocks.OAK_STAIRS.getDefaultState().with(StairsBlock.FACING, Direction.NORTH));
         setBlock(world, bounds, origin.add(-1, 0, 1), Blocks.OAK_STAIRS.getDefaultState().with(StairsBlock.FACING, Direction.NORTH));
         setBlock(world, bounds, origin.add(2, 0, 0), Blocks.CAULDRON.getDefaultState());
 
-        // Wall Sign next to entrance
-        placeWallSign(world, bounds, origin.add(-1, 1, 0), Direction.SOUTH,
-                "ПАДИК №1", "СЕМКИ ЕСТЬ?", "НЕ КУРИТЬ", "ШТРАФ 5000");
-
-        // Spawn Boss: Старший по падику
-        BlockPos bossPos = origin.add(0, 0, 1);
-        if (bounds.contains(bossPos)) {
-            ZombieEntity boss = EntityType.ZOMBIE.create(world.toServerWorld(), null, bossPos, SpawnReason.STRUCTURE, true, false);
-            if (boss != null) {
-                boss.setBaby(false);
-                boss.setPersistent();
-                boss.addCommandTag("bazar_boss_padik");
-                boss.setCustomName(Text.literal("Старший по падику").formatted(Formatting.GOLD, Formatting.BOLD));
-                boss.setCustomNameVisible(true);
-                if (boss.getAttributeInstance(EntityAttributes.GENERIC_MAX_HEALTH) != null) {
-                    boss.getAttributeInstance(EntityAttributes.GENERIC_MAX_HEALTH).setBaseValue(50.0);
-                    boss.setHealth(50.0f);
-                }
-                ItemStack jacket = new ItemStack(Items.LEATHER_CHESTPLATE);
-                jacket.set(DataComponentTypes.DYED_COLOR, new DyedColorComponent(0x1E1E24, false));
-                boss.equipStack(EquipmentSlot.CHEST, jacket);
-                boss.equipStack(EquipmentSlot.MAINHAND, PsychedelicraftIntegration.createCigarette(1));
-                world.spawnEntityAndPassengers(boss);
-            }
-        }
+        setBlock(world, bounds, origin.add(-1, 1, 0), Blocks.OAK_WALL_SIGN.getDefaultState().with(WallSignBlock.FACING, Direction.SOUTH));
     }
 
-    // =========================================================================
-    // 2. ЛАРЁК С ПИВОМ 24/7 (Киоск + столики + Дядя Витя)
-    // =========================================================================
-    private static void buildBeerKiosk(ServerWorldAccess world, BlockBox bounds, BlockPos origin, Random random) {
+    private static void placeBeerKioskBlocks(ServerWorldAccess world, BlockBox bounds, BlockPos origin) {
         for (int dx = -3; dx <= 3; dx++) {
             for (int dz = -3; dz <= 3; dz++) {
                 fillColumnDown(world, bounds, origin.add(dx, -1, dz), Blocks.COBBLESTONE.getDefaultState());
@@ -251,7 +277,6 @@ public class BazarStructures {
             }
         }
 
-        // Kiosk booth (x: -2..2, z: -3..-1, y: 0..2)
         for (int y = 0; y <= 2; y++) {
             for (int dx = -2; dx <= 2; dx++) {
                 for (int dz = -3; dz <= -1; dz++) {
@@ -264,13 +289,11 @@ public class BazarStructures {
             }
         }
 
-        // Counter window in front (x: -1..1, y: 1, z: -1) + Trapdoor counter shelf
         for (int dx = -1; dx <= 1; dx++) {
             setBlock(world, bounds, origin.add(dx, 1, -1), Blocks.GLASS_PANE.getDefaultState());
             setBlock(world, bounds, origin.add(dx, 1, 0), Blocks.SPRUCE_TRAPDOOR.getDefaultState().with(TrapdoorBlock.HALF, BlockHalf.TOP).with(TrapdoorBlock.OPEN, false));
         }
 
-        // Striped awning roof
         for (int dx = -3; dx <= 3; dx++) {
             for (int dz = -3; dz <= 0; dz++) {
                 BlockState roof = (Math.abs(dx) % 2 == 0) ? Blocks.LIME_CONCRETE.getDefaultState() : Blocks.YELLOW_CONCRETE.getDefaultState();
@@ -279,46 +302,19 @@ public class BazarStructures {
         }
         setBlock(world, bounds, origin.add(0, 2, 0), Blocks.LANTERN.getDefaultState().with(LanternBlock.HANGING, true));
 
-        // Inside kiosk: Barrel of Beer & Loot Chest
         setBlock(world, bounds, origin.add(-1, 0, -2), Blocks.BARREL.getDefaultState());
-        placeLootChest(world, bounds, origin.add(1, 0, -2), Direction.SOUTH, "chests/beer_kiosk", random);
+        setBlock(world, bounds, origin.add(1, 0, -2), Blocks.CHEST.getDefaultState().with(ChestBlock.FACING, Direction.SOUTH));
 
-        // Outdoor standing table (Fence + Pressure plate) & stools
         setBlock(world, bounds, origin.add(-2, 0, 2), Blocks.OAK_FENCE.getDefaultState());
         setBlock(world, bounds, origin.add(-2, 1, 2), Blocks.OAK_PRESSURE_PLATE.getDefaultState());
         setBlock(world, bounds, origin.add(-1, 0, 2), Blocks.OAK_SLAB.getDefaultState());
         setBlock(world, bounds, origin.add(2, 0, 2), Blocks.OAK_FENCE.getDefaultState());
         setBlock(world, bounds, origin.add(2, 1, 2), Blocks.OAK_PRESSURE_PLATE.getDefaultState());
 
-        // Kiosk Sign
-        placeWallSign(world, bounds, origin.add(0, 2, 0), Direction.SOUTH,
-                "ЛАРЁК 24/7", "ЖИВОЕ ПЕННОЕ", "ВОДКА И РЫБКА", "В ДОЛГ НЕ ДАЁМ");
-
-        // Spawn Boss: Дядя Витя (Хозяин ларька)
-        BlockPos bossPos = origin.add(0, 0, 1);
-        if (bounds.contains(bossPos)) {
-            ZombieVillagerEntity boss = EntityType.ZOMBIE_VILLAGER.create(world.toServerWorld(), null, bossPos, SpawnReason.STRUCTURE, true, false);
-            if (boss != null) {
-                boss.setBaby(false);
-                boss.setPersistent();
-                boss.addCommandTag("bazar_boss_kiosk");
-                boss.setCustomName(Text.literal("Дядя Витя (Хозяин ларька)").formatted(Formatting.GOLD, Formatting.BOLD));
-                boss.setCustomNameVisible(true);
-                if (boss.getAttributeInstance(EntityAttributes.GENERIC_MAX_HEALTH) != null) {
-                    boss.getAttributeInstance(EntityAttributes.GENERIC_MAX_HEALTH).setBaseValue(55.0);
-                    boss.setHealth(55.0f);
-                }
-                boss.equipStack(EquipmentSlot.MAINHAND, PsychedelicraftIntegration.createBeerMug());
-                boss.equipStack(EquipmentSlot.OFFHAND, PsychedelicraftIntegration.createVodkaBottle());
-                world.spawnEntityAndPassengers(boss);
-            }
-        }
+        setBlock(world, bounds, origin.add(0, 2, 0), Blocks.OAK_WALL_SIGN.getDefaultState().with(WallSignBlock.FACING, Direction.SOUTH));
     }
 
-    // =========================================================================
-    // 3. ДЕДОВСКИЙ ГАРАЖ (Металлический бокс + мангал + Батя с карбюратором)
-    // =========================================================================
-    private static void buildGarage(ServerWorldAccess world, BlockBox bounds, BlockPos origin, Random random) {
+    private static void placeGarageBlocks(ServerWorldAccess world, BlockBox bounds, BlockPos origin) {
         for (int dx = -3; dx <= 3; dx++) {
             for (int dz = -4; dz <= 3; dz++) {
                 fillColumnDown(world, bounds, origin.add(dx, -1, dz), Blocks.COBBLESTONE.getDefaultState());
@@ -327,13 +323,11 @@ public class BazarStructures {
             }
         }
 
-        // Metal Garage Box (x: -3..3, z: -4..0, y: 0..3)
         for (int y = 0; y <= 3; y++) {
             for (int dx = -3; dx <= 3; dx++) {
                 for (int dz = -4; dz <= 0; dz++) {
                     boolean isWall = (dx == -3 || dx == 3 || dz == -4 || dz == 0);
                     if (isWall) {
-                        // Open wide garage gates on front (z=0, x=-1..1, y=0..2)
                         if (dz == 0 && Math.abs(dx) <= 1 && y <= 2) {
                             continue;
                         }
@@ -343,57 +337,99 @@ public class BazarStructures {
                 }
             }
         }
-        // Garage Roof
         for (int dx = -3; dx <= 3; dx++) {
             for (int dz = -4; dz <= 0; dz++) {
                 setBlock(world, bounds, origin.add(dx, 4, dz), Blocks.STONE_BRICK_SLAB.getDefaultState());
             }
         }
 
-        // Inside Garage: Crafting Table, Anvil, Blast Furnace, Chest
         setBlock(world, bounds, origin.add(-2, 0, -3), Blocks.CRAFTING_TABLE.getDefaultState());
         setBlock(world, bounds, origin.add(-2, 0, -2), Blocks.ANVIL.getDefaultState());
         setBlock(world, bounds, origin.add(2, 0, -3), Blocks.BLAST_FURNACE.getDefaultState().with(BlastFurnaceBlock.FACING, Direction.WEST));
-        placeLootChest(world, bounds, origin.add(0, 0, -3), Direction.SOUTH, "chests/garage", random);
+        setBlock(world, bounds, origin.add(0, 0, -3), Blocks.CHEST.getDefaultState().with(ChestBlock.FACING, Direction.SOUTH));
 
-        // Outdoor Mangal (Campfire) & Sign
         setBlock(world, bounds, origin.add(2, 0, 2), Blocks.CAMPFIRE.getDefaultState());
-        placeWallSign(world, bounds, origin.add(-2, 1, 1), Direction.SOUTH,
-                "ГСК «МОТОР»", "ГАРАЖ БАТИ", "КАРБЮРАТОР", "НЕ ТРОГАТЬ!");
+        setBlock(world, bounds, origin.add(-2, 1, 1), Blocks.OAK_WALL_SIGN.getDefaultState().with(WallSignBlock.FACING, Direction.SOUTH));
+    }
 
-        // Spawn Boss: Батя с карбюратором
-        BlockPos bossPos = origin.add(0, 0, 1);
-        if (bounds.contains(bossPos)) {
-            PillagerEntity boss = EntityType.PILLAGER.create(world.toServerWorld(), null, bossPos, SpawnReason.STRUCTURE, true, false);
-            if (boss != null) {
-                boss.setPersistent();
-                boss.addCommandTag("bazar_boss_garage");
-                boss.setCustomName(Text.literal("Батя с карбюратором").formatted(Formatting.GOLD, Formatting.BOLD));
-                boss.setCustomNameVisible(true);
-                if (boss.getAttributeInstance(EntityAttributes.GENERIC_MAX_HEALTH) != null) {
-                    boss.getAttributeInstance(EntityAttributes.GENERIC_MAX_HEALTH).setBaseValue(60.0);
-                    boss.setHealth(60.0f);
+    // =========================================================================
+    // MAIN-THREAD FINALIZATION (Spawns Boss + Sets Sign Text + Fills Chest)
+    // =========================================================================
+
+    private static void finalizeSpotOnMainThread(ServerWorld world, BlockPos origin, String spotKind) {
+        try {
+            switch (spotKind) {
+                case SPOT_PADIK -> {
+                    writeSignText(world, origin.add(-1, 1, 0), "ПАДИК №1", "СЕМКИ ЕСТЬ?", "НЕ КУРИТЬ", "ШТРАФ 5000");
+                    fillChestLoot(world, origin.add(2, 0, -3), "bazar_boss_padik",
+                            List.of(new ItemStack(Items.EMERALD, 4), new ItemStack(Items.GOLDEN_APPLE, 1), new ItemStack(Items.PUMPKIN_SEEDS, 12)));
+
+                    BlockPos bossPos = origin.add(0, 0, 1);
+                    ZombieEntity boss = new ZombieEntity(EntityType.ZOMBIE, world);
+                    boss.refreshPositionAndAngles(bossPos.getX() + 0.5, bossPos.getY(), bossPos.getZ() + 0.5, 0.0f, 0.0f);
+                    boss.setBaby(false);
+                    boss.setPersistent();
+                    boss.addCommandTag("bazar_boss_padik");
+                    boss.setCustomName(Text.literal("Старший по падику").formatted(Formatting.GOLD, Formatting.BOLD));
+                    boss.setCustomNameVisible(true);
+                    if (boss.getAttributeInstance(EntityAttributes.GENERIC_MAX_HEALTH) != null) {
+                        boss.getAttributeInstance(EntityAttributes.GENERIC_MAX_HEALTH).setBaseValue(50.0);
+                        boss.setHealth(50.0f);
+                    }
+                    ItemStack jacket = new ItemStack(Items.LEATHER_CHESTPLATE);
+                    jacket.set(DataComponentTypes.DYED_COLOR, new DyedColorComponent(0x1E1E24, false));
+                    boss.equipStack(EquipmentSlot.CHEST, jacket);
+                    boss.equipStack(EquipmentSlot.MAINHAND, PsychedelicraftIntegration.createCigarette(1));
+                    world.spawnEntity(boss);
                 }
-                boss.equipStack(EquipmentSlot.MAINHAND, PsychedelicraftIntegration.createVodkaBottle());
-                boss.equipStack(EquipmentSlot.OFFHAND, PsychedelicraftIntegration.createJoint(1));
-                world.spawnEntityAndPassengers(boss);
+                case SPOT_KIOSK -> {
+                    writeSignText(world, origin.add(0, 2, 0), "ЛАРЁК 24/7", "ЖИВОЕ ПЕННОЕ", "ВОДКА И РЫБКА", "В ДОЛГ НЕ ДАЁМ");
+                    fillChestLoot(world, origin.add(1, 0, -2), "bazar_boss_kiosk",
+                            List.of(new ItemStack(Items.EMERALD, 5), new ItemStack(Items.COOKED_COD, 6)));
+
+                    BlockPos bossPos = origin.add(0, 0, 1);
+                    ZombieVillagerEntity boss = new ZombieVillagerEntity(EntityType.ZOMBIE_VILLAGER, world);
+                    boss.refreshPositionAndAngles(bossPos.getX() + 0.5, bossPos.getY(), bossPos.getZ() + 0.5, 0.0f, 0.0f);
+                    boss.setBaby(false);
+                    boss.setPersistent();
+                    boss.addCommandTag("bazar_boss_kiosk");
+                    boss.setCustomName(Text.literal("Дядя Витя (Хозяин ларька)").formatted(Formatting.GOLD, Formatting.BOLD));
+                    boss.setCustomNameVisible(true);
+                    if (boss.getAttributeInstance(EntityAttributes.GENERIC_MAX_HEALTH) != null) {
+                        boss.getAttributeInstance(EntityAttributes.GENERIC_MAX_HEALTH).setBaseValue(55.0);
+                        boss.setHealth(55.0f);
+                    }
+                    boss.equipStack(EquipmentSlot.MAINHAND, PsychedelicraftIntegration.createBeerMug());
+                    boss.equipStack(EquipmentSlot.OFFHAND, PsychedelicraftIntegration.createVodkaBottle());
+                    world.spawnEntity(boss);
+                }
+                case SPOT_GARAGE -> {
+                    writeSignText(world, origin.add(-2, 1, 1), "ГСК «МОТОР»", "ГАРАЖ БАТИ", "КАРБЮРАТОР", "НЕ ТРОГАТЬ!");
+                    fillChestLoot(world, origin.add(0, 0, -3), "bazar_boss_garage",
+                            List.of(new ItemStack(Items.DIAMOND, 2), new ItemStack(Items.IRON_INGOT, 8)));
+
+                    BlockPos bossPos = origin.add(0, 0, 1);
+                    PillagerEntity boss = new PillagerEntity(EntityType.PILLAGER, world);
+                    boss.refreshPositionAndAngles(bossPos.getX() + 0.5, bossPos.getY(), bossPos.getZ() + 0.5, 0.0f, 0.0f);
+                    boss.setPersistent();
+                    boss.addCommandTag("bazar_boss_garage");
+                    boss.setCustomName(Text.literal("Батя с карбюратором").formatted(Formatting.GOLD, Formatting.BOLD));
+                    boss.setCustomNameVisible(true);
+                    if (boss.getAttributeInstance(EntityAttributes.GENERIC_MAX_HEALTH) != null) {
+                        boss.getAttributeInstance(EntityAttributes.GENERIC_MAX_HEALTH).setBaseValue(60.0);
+                        boss.setHealth(60.0f);
+                    }
+                    boss.equipStack(EquipmentSlot.MAINHAND, PsychedelicraftIntegration.createVodkaBottle());
+                    boss.equipStack(EquipmentSlot.OFFHAND, PsychedelicraftIntegration.createJoint(1));
+                    world.spawnEntity(boss);
+                }
             }
+        } catch (Exception e) {
+            BazarMod.LOGGER.error("Failed to finalize Bazar spot {} at {}", spotKind, origin, e);
         }
     }
 
-    private static void placeLootChest(ServerWorldAccess world, BlockBox bounds, BlockPos pos, Direction facing, String lootTablePath, Random random) {
-        if (!bounds.contains(pos)) return;
-        world.setBlockState(pos, Blocks.CHEST.getDefaultState().with(ChestBlock.FACING, facing), Block.NOTIFY_LISTENERS);
-        BlockEntity be = world.getBlockEntity(pos);
-        if (be instanceof ChestBlockEntity chest) {
-            chest.setLootTable(RegistryKey.of(RegistryKeys.LOOT_TABLE, Identifier.of(BazarMod.MOD_ID, lootTablePath)), random.nextLong());
-        }
-    }
-
-    private static void placeWallSign(ServerWorldAccess world, BlockBox bounds, BlockPos pos, Direction facing,
-                                      String l1, String l2, String l3, String l4) {
-        if (!bounds.contains(pos)) return;
-        world.setBlockState(pos, Blocks.OAK_WALL_SIGN.getDefaultState().with(WallSignBlock.FACING, facing), Block.NOTIFY_LISTENERS);
+    private static void writeSignText(ServerWorld world, BlockPos pos, String l1, String l2, String l3, String l4) {
         BlockEntity be = world.getBlockEntity(pos);
         if (be instanceof SignBlockEntity sign) {
             sign.changeText(text -> text
@@ -402,6 +438,24 @@ public class BazarStructures {
                     .withMessage(2, Text.literal(l3))
                     .withMessage(3, Text.literal(l4))
                     .withColor(DyeColor.BLACK), true);
+        }
+    }
+
+    private static void fillChestLoot(ServerWorld world, BlockPos pos, String bossTag, List<ItemStack> baseLoot) {
+        BlockEntity be = world.getBlockEntity(pos);
+        if (be instanceof ChestBlockEntity chest) {
+            int slot = 0;
+            for (ItemStack base : baseLoot) {
+                if (slot < chest.size()) {
+                    chest.setStack(slot++, base);
+                }
+            }
+            for (ItemStack modLoot : PsychedelicraftIntegration.generateSpotBossLoot(bossTag)) {
+                if (slot < chest.size()) {
+                    chest.setStack(slot++, modLoot);
+                }
+            }
+            chest.markDirty();
         }
     }
 
