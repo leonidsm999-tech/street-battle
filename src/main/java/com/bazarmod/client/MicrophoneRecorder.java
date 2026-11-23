@@ -14,7 +14,14 @@ public class MicrophoneRecorder {
     private static final int SAMPLE_SIZE_BITS = 16;
     private static final int CHANNELS = 1;
 
+    private static volatile float currentLevel = 0.0f;
+
+    public static float getCurrentLevel() {
+        return currentLevel;
+    }
+
     public static void recordAsync(int durationSec, Consumer<byte[]> onComplete) {
+        currentLevel = 0.0f;
         Thread thread = new Thread(() -> {
             AudioFormat format = new AudioFormat(SAMPLE_RATE, SAMPLE_SIZE_BITS, CHANNELS, true, false);
             DataLine.Info info = new DataLine.Info(TargetDataLine.class, format);
@@ -37,20 +44,36 @@ public class MicrophoneRecorder {
                     int read = line.read(chunk, 0, chunk.length);
                     if (read > 0) {
                         pcmBuffer.write(chunk, 0, read);
+                        currentLevel = computeRmsLevel(chunk, read);
                     }
                 }
 
                 line.stop();
+                currentLevel = 0.0f;
                 byte[] wavBytes = wrapPcmAsWav(pcmBuffer.toByteArray());
                 onComplete.accept(wavBytes);
             } catch (Exception e) {
                 BazarMod.LOGGER.error("Microphone recording failed", e);
+                currentLevel = 0.0f;
                 onComplete.accept(wrapPcmAsWav(new byte[3200]));
             }
         }, "BazarMod-MicRecorder");
 
         thread.setDaemon(true);
         thread.start();
+    }
+
+    private static float computeRmsLevel(byte[] pcm, int len) {
+        long sumSq = 0;
+        int samples = len / 2;
+        for (int i = 0; i + 1 < len; i += 2) {
+            short sample = (short) ((pcm[i + 1] << 8) | (pcm[i] & 0xFF));
+            sumSq += (long) sample * sample;
+        }
+        if (samples == 0) return 0.0f;
+        double rms = Math.sqrt((double) sumSq / samples);
+        // Normalize typical speech RMS (~4000-12000) to 0.0..1.0
+        return (float) Math.min(1.0, rms / 9000.0);
     }
 
     private static byte[] wrapPcmAsWav(byte[] pcmData) {
@@ -64,8 +87,8 @@ public class MicrophoneRecorder {
         header.putInt(chunkSize);
         header.put("WAVE".getBytes());
         header.put("fmt ".getBytes());
-        header.putInt(16); // Subchunk1Size for PCM
-        header.putShort((short) 1); // AudioFormat 1 = PCM
+        header.putInt(16);
+        header.putShort((short) 1);
         header.putShort((short) CHANNELS);
         header.putInt((int) SAMPLE_RATE);
         header.putInt(byteRate);

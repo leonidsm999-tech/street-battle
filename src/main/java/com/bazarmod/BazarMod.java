@@ -54,8 +54,9 @@ public class BazarMod implements ModInitializer {
         public final UUID primaryPlayerId;
         public UUID helperPlayerId = null;
         public final UUID targetMobId;
+        public final int targetEntityId;
         public final String mobName;
-        public final String mobClaim;
+        public final List<String> mobDissLines;
         public final List<String> promptWords;
         public final long createdTick;
         public boolean evaluating = false;
@@ -63,8 +64,9 @@ public class BazarMod implements ModInitializer {
         public ShowdownSession(UUID primaryPlayerId, LivingEntity target, BazarDictionary.PromptBundle bundle, long createdTick) {
             this.primaryPlayerId = primaryPlayerId;
             this.targetMobId = target.getUuid();
+            this.targetEntityId = target.getId();
             this.mobName = target.getName().getString();
-            this.mobClaim = bundle.claim();
+            this.mobDissLines = bundle.mobDissLines();
             this.promptWords = bundle.words();
             this.createdTick = createdTick;
         }
@@ -126,9 +128,10 @@ public class BazarMod implements ModInitializer {
                     }
                 }
 
+                String fullDiss = String.join(" ", session.mobDissLines);
                 GeminiJudgeClient.evaluateAsync(
                         session.mobName,
-                        session.mobClaim,
+                        fullDiss,
                         session.promptWords,
                         payload.wavData()
                 ).thenAccept(verdict -> server.execute(() -> finishShowdown(server, session, verdict)));
@@ -152,8 +155,9 @@ public class BazarMod implements ModInitializer {
 
                 ServerPlayNetworking.send(helper, new BazarNetworking.StartShowdownPayload(
                         session.id,
+                        session.targetEntityId,
                         session.mobName,
-                        session.mobClaim,
+                        session.mobDissLines,
                         new ArrayList<>(helperWords),
                         Math.max(5, BazarConfig.get().battleDurationSec / 2),
                         true
@@ -166,13 +170,37 @@ public class BazarMod implements ModInitializer {
             });
         });
 
+        // Receive updated config from client GUI
+        ServerPlayNetworking.registerGlobalReceiver(BazarNetworking.SyncConfigPayload.ID, (payload, context) -> {
+            ServerPlayerEntity player = context.player();
+            MinecraftServer server = player.getServer();
+            if (server == null) return;
+
+            server.execute(() -> {
+                if (!server.isSingleplayer() && !player.hasPermissionLevel(2)) {
+                    player.sendMessage(Text.literal("⚠ Настройки сохранены локально (на сервере нужны права OP для смены API ключа).").formatted(Formatting.YELLOW), false);
+                    return;
+                }
+                BazarConfig cfg = BazarConfig.get();
+                cfg.apiKey = payload.apiKey();
+                cfg.model = payload.model();
+                cfg.proxyHost = payload.proxyHost();
+                cfg.proxyPort = payload.proxyPort();
+                cfg.battleDurationSec = payload.battleDurationSec();
+                cfg.minWinScore = payload.minWinScore();
+                cfg.mockMode = payload.mockMode();
+                cfg.save();
+                player.sendMessage(Text.literal("✅ Настройки Дворовой Стрелки применены!").formatted(Formatting.GREEN), false);
+            });
+        });
+
         // Keep combatants frozen during showdown & cleanup stale sessions
         ServerTickEvents.END_SERVER_TICK.register(server -> {
             long now = server.getOverworld().getTime();
             Iterator<Map.Entry<UUID, ShowdownSession>> it = ACTIVE_SHOWDOWNS.entrySet().iterator();
             while (it.hasNext()) {
                 ShowdownSession session = it.next().getValue();
-                if (now - session.createdTick > 20L * 45) { // 45s safety timeout
+                if (now - session.createdTick > 20L * 55) { // 55s safety timeout (5s diss + 30s talk + 20s API)
                     it.remove();
                     continue;
                 }
@@ -189,7 +217,7 @@ public class BazarMod implements ModInitializer {
             }
         });
 
-        // Commands: /bazar test & /bazar reload
+        // Commands: /bazar test, /bazar config, /bazar reload
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> registerCommands(dispatcher));
     }
 
@@ -217,6 +245,11 @@ public class BazarMod implements ModInitializer {
                     startShowdown(player, target);
                     return 1;
                 }))
+                .then(CommandManager.literal("config").executes(ctx -> {
+                    ServerPlayerEntity player = ctx.getSource().getPlayerOrThrow();
+                    ServerPlayNetworking.send(player, new BazarNetworking.OpenConfigPayload(true));
+                    return 1;
+                }))
                 .then(CommandManager.literal("reload").executes(ctx -> {
                     BazarConfig.reload();
                     ctx.getSource().sendFeedback(() -> Text.literal("✅ Конфиг bazar_mod.properties перезагружен!").formatted(Formatting.GREEN), false);
@@ -233,19 +266,21 @@ public class BazarMod implements ModInitializer {
         ShowdownSession session = new ShowdownSession(player.getUuid(), target, bundle, world.getTime());
         ACTIVE_SHOWDOWNS.put(session.id, session);
 
-        // Freeze target & spawn smoke particles
-        target.addStatusEffect(new StatusEffectInstance(StatusEffects.SLOWNESS, cfg.battleDurationSec * 20 + 60, 255, false, false));
-        target.addStatusEffect(new StatusEffectInstance(StatusEffects.RESISTANCE, cfg.battleDurationSec * 20 + 60, 255, false, false));
+        int freezeTicks = (cfg.battleDurationSec + 8) * 20;
+        target.addStatusEffect(new StatusEffectInstance(StatusEffects.SLOWNESS, freezeTicks, 255, false, false));
+        target.addStatusEffect(new StatusEffectInstance(StatusEffects.RESISTANCE, freezeTicks, 255, false, false));
         world.spawnParticles(ParticleTypes.CAMPFIRE_COSY_SMOKE, target.getX(), target.getY() + 1.0, target.getZ(), 25, 0.7, 0.5, 0.7, 0.02);
 
+        String fullDiss = String.join(" ", session.mobDissLines);
         player.sendMessage(Text.literal("🔥 СТРЕЛКА С ").formatted(Formatting.GOLD, Formatting.BOLD)
                 .append(Text.literal(session.mobName).formatted(Formatting.RED, Formatting.BOLD))
-                .append(Text.literal("! Предъява: «" + session.mobClaim + "»").formatted(Formatting.YELLOW)), false);
+                .append(Text.literal(": «" + fullDiss + "»").formatted(Formatting.YELLOW)), false);
 
         ServerPlayNetworking.send(player, new BazarNetworking.StartShowdownPayload(
                 session.id,
+                session.targetEntityId,
                 session.mobName,
-                session.mobClaim,
+                session.mobDissLines,
                 session.promptWords,
                 cfg.battleDurationSec,
                 false
@@ -276,12 +311,13 @@ public class BazarMod implements ModInitializer {
         if (mob != null) {
             mob.removeStatusEffect(StatusEffects.SLOWNESS);
             mob.removeStatusEffect(StatusEffects.RESISTANCE);
-            IMMUNE_UNTIL_TICK.put(mob.getUuid(), world.getTime() + 100L); // 5s cooldown
+            IMMUNE_UNTIL_TICK.put(mob.getUuid(), world.getTime() + 100L);
         }
 
         BazarNetworking.ShowdownResultPayload resultPayload = new BazarNetworking.ShowdownResultPayload(
                 verdict.win(),
                 verdict.score(),
+                session.promptWords,
                 verdict.usedWords(),
                 verdict.judgeComment(),
                 verdict.mobReaction()
@@ -303,7 +339,6 @@ public class BazarMod implements ModInitializer {
 
             if (mob != null) {
                 world.spawnParticles(ParticleTypes.TOTEM_OF_UNDYING, mob.getX(), mob.getY() + 1.0, mob.getZ(), 40, 0.5, 0.8, 0.5, 0.2);
-                // Bonus emerald drop for winning the argument
                 world.spawnEntity(new ItemEntity(world, mob.getX(), mob.getY() + 0.5, mob.getZ(), new ItemStack(Items.EMERALD, 1 + new Random().nextInt(2))));
                 mob.damage(world.getDamageSources().playerAttack(player), 9999.0f);
             }

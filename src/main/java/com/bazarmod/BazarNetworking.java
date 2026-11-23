@@ -28,11 +28,12 @@ public class BazarNetworking {
         return list;
     }
 
-    // S2C: Start showdown on client
+    // S2C: Start showdown on client (includes mobEntityId for 3D render & multi-line diss)
     public record StartShowdownPayload(
             UUID showdownId,
+            int mobEntityId,
             String mobName,
-            String mobClaim,
+            List<String> mobDissLines,
             List<String> promptWords,
             int durationSec,
             boolean isHelper
@@ -41,16 +42,18 @@ public class BazarNetworking {
         public static final PacketCodec<RegistryByteBuf, StartShowdownPayload> CODEC = PacketCodec.ofStatic(
                 (buf, payload) -> {
                     buf.writeUuid(payload.showdownId);
+                    buf.writeVarInt(payload.mobEntityId);
                     buf.writeString(payload.mobName);
-                    buf.writeString(payload.mobClaim);
+                    writeStringList(buf, payload.mobDissLines);
                     writeStringList(buf, payload.promptWords);
                     buf.writeVarInt(payload.durationSec);
                     buf.writeBoolean(payload.isHelper);
                 },
                 buf -> new StartShowdownPayload(
                         buf.readUuid(),
+                        buf.readVarInt(),
                         buf.readString(),
-                        buf.readString(),
+                        readStringList(buf),
                         readStringList(buf),
                         buf.readVarInt(),
                         buf.readBoolean()
@@ -93,6 +96,7 @@ public class BazarNetworking {
     public record ShowdownResultPayload(
             boolean win,
             int score,
+            List<String> promptWords,
             List<String> usedWords,
             String judgeComment,
             String mobReaction
@@ -102,6 +106,7 @@ public class BazarNetworking {
                 (buf, payload) -> {
                     buf.writeBoolean(payload.win);
                     buf.writeVarInt(payload.score);
+                    writeStringList(buf, payload.promptWords);
                     writeStringList(buf, payload.usedWords);
                     buf.writeString(payload.judgeComment);
                     buf.writeString(payload.mobReaction);
@@ -109,6 +114,7 @@ public class BazarNetworking {
                 buf -> new ShowdownResultPayload(
                         buf.readBoolean(),
                         buf.readVarInt(),
+                        readStringList(buf),
                         readStringList(buf),
                         buf.readString(),
                         buf.readString()
@@ -127,6 +133,20 @@ public class BazarNetworking {
         public static final PacketCodec<RegistryByteBuf, StopMusicPayload> CODEC = PacketCodec.ofStatic(
                 (buf, payload) -> buf.writeBoolean(payload.stop),
                 buf -> new StopMusicPayload(buf.readBoolean())
+        );
+
+        @Override
+        public Id<? extends CustomPayload> getId() {
+            return ID;
+        }
+    }
+
+    // S2C: Open config screen on client (triggered by /bazar config)
+    public record OpenConfigPayload(boolean open) implements CustomPayload {
+        public static final Id<OpenConfigPayload> ID = new Id<>(Identifier.of(BazarMod.MOD_ID, "open_config"));
+        public static final PacketCodec<RegistryByteBuf, OpenConfigPayload> CODEC = PacketCodec.ofStatic(
+                (buf, payload) -> buf.writeBoolean(payload.open),
+                buf -> new OpenConfigPayload(buf.readBoolean())
         );
 
         @Override
@@ -169,13 +189,53 @@ public class BazarNetworking {
         }
     }
 
+    // C2S: Sync config edited in-game to server
+    public record SyncConfigPayload(
+            String apiKey,
+            String model,
+            String proxyHost,
+            int proxyPort,
+            int battleDurationSec,
+            int minWinScore,
+            boolean mockMode
+    ) implements CustomPayload {
+        public static final Id<SyncConfigPayload> ID = new Id<>(Identifier.of(BazarMod.MOD_ID, "sync_config"));
+        public static final PacketCodec<RegistryByteBuf, SyncConfigPayload> CODEC = PacketCodec.ofStatic(
+                (buf, payload) -> {
+                    buf.writeString(payload.apiKey);
+                    buf.writeString(payload.model);
+                    buf.writeString(payload.proxyHost);
+                    buf.writeVarInt(payload.proxyPort);
+                    buf.writeVarInt(payload.battleDurationSec);
+                    buf.writeVarInt(payload.minWinScore);
+                    buf.writeBoolean(payload.mockMode);
+                },
+                buf -> new SyncConfigPayload(
+                        buf.readString(),
+                        buf.readString(),
+                        buf.readString(),
+                        buf.readVarInt(),
+                        buf.readVarInt(),
+                        buf.readVarInt(),
+                        buf.readBoolean()
+                )
+        );
+
+        @Override
+        public Id<? extends CustomPayload> getId() {
+            return ID;
+        }
+    }
+
     public static void registerPayloads() {
         PayloadTypeRegistry.playS2C().register(StartShowdownPayload.ID, StartShowdownPayload.CODEC);
         PayloadTypeRegistry.playS2C().register(InviteFriendPayload.ID, InviteFriendPayload.CODEC);
         PayloadTypeRegistry.playS2C().register(ShowdownResultPayload.ID, ShowdownResultPayload.CODEC);
         PayloadTypeRegistry.playS2C().register(StopMusicPayload.ID, StopMusicPayload.CODEC);
+        PayloadTypeRegistry.playS2C().register(OpenConfigPayload.ID, OpenConfigPayload.CODEC);
 
         PayloadTypeRegistry.playC2S().register(SubmitAudioPayload.ID, SubmitAudioPayload.CODEC);
         PayloadTypeRegistry.playC2S().register(JoinShowdownPayload.ID, JoinShowdownPayload.CODEC);
+        PayloadTypeRegistry.playC2S().register(SyncConfigPayload.ID, SyncConfigPayload.CODEC);
     }
 }
