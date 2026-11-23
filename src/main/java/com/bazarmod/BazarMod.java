@@ -351,7 +351,7 @@ public class BazarMod implements ModInitializer {
             while (it.hasNext()) {
                 ShowdownSession session = it.next().getValue();
                 ServerPlayerEntity player = server.getPlayerManager().getPlayer(session.primaryPlayerId);
-                if (player == null || now - session.createdTick > 20L * 65) {
+                if (player == null || now - session.createdTick > 20L * 120) {
                     if (player != null) {
                         cleanupSessionEntities(player.getServerWorld(), session);
                     }

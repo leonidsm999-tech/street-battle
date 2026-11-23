@@ -24,9 +24,113 @@ public class GeminiJudgeClient {
             String mobReaction
     ) {}
 
-    private static final Gson GSON = new Gson();
-
     public record ConnectionTestResult(boolean ok, String message) {}
+
+    private static final Gson GSON = new Gson();
+    private static final String STABLE_FALLBACK_MODEL = "gemini-2.5-flash";
+
+    private static volatile HttpClient cachedClient = null;
+    private static volatile String cachedProxySignature = "";
+
+    private static synchronized HttpClient getSharedClient(String proxyHost, int proxyPort) {
+        String sig = (proxyHost == null ? "" : proxyHost.trim()) + ":" + proxyPort;
+        if (cachedClient == null || !sig.equals(cachedProxySignature)) {
+            HttpClient.Builder builder = HttpClient.newBuilder()
+                    .version(HttpClient.Version.HTTP_1_1)
+                    .connectTimeout(Duration.ofSeconds(25));
+            if (proxyHost != null && !proxyHost.isBlank() && proxyPort > 0) {
+                builder.proxy(ProxySelector.of(new InetSocketAddress(proxyHost.trim(), proxyPort)));
+            }
+            cachedClient = builder.build();
+            cachedProxySignature = sig;
+        }
+        return cachedClient;
+    }
+
+    private static boolean isRetryableStatus(int code) {
+        return code == 503 || code == 429 || code == 500 || code == 502 || code == 504;
+    }
+
+    private static String extractApiErrorMessage(int statusCode, String body) {
+        String msg = "HTTP " + statusCode;
+        try {
+            JsonObject errJson = JsonParser.parseString(body).getAsJsonObject();
+            if (errJson.has("error") && errJson.getAsJsonObject("error").has("message")) {
+                msg = statusCode + ": " + errJson.getAsJsonObject("error").get("message").getAsString();
+            }
+        } catch (Exception ignored) {}
+        if (statusCode == 503) {
+            return "503 (Серверы Google перегружены — модель временно занята)";
+        }
+        return msg;
+    }
+
+    private static HttpResponse<String> sendWithRetries(
+            HttpClient client,
+            String apiKey,
+            String primaryModel,
+            String jsonBody,
+            int maxAttempts,
+            Duration requestTimeout
+    ) throws Exception {
+        String currentModel = primaryModel;
+        HttpResponse<String> lastResponse = null;
+        Exception lastException = null;
+
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                String url = "https://generativelanguage.googleapis.com/v1beta/models/"
+                        + currentModel + ":generateContent?key=" + apiKey;
+
+                HttpRequest request = HttpRequest.newBuilder()
+                        .uri(URI.create(url))
+                        .timeout(requestTimeout)
+                        .header("Content-Type", "application/json; charset=UTF-8")
+                        .POST(HttpRequest.BodyPublishers.ofString(jsonBody, StandardCharsets.UTF_8))
+                        .build();
+
+                HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+                lastResponse = response;
+
+                if (response.statusCode() == 200) {
+                    return response;
+                }
+
+                if (isRetryableStatus(response.statusCode()) && attempt < maxAttempts) {
+                    BazarMod.LOGGER.warn("Gemini API returned {} on model {} (attempt {}/{}), retrying...",
+                            response.statusCode(), currentModel, attempt, maxAttempts);
+
+                    // If a preview model is overloaded (503) on the last retry, fall back to stable gemini-2.5-flash
+                    if (response.statusCode() == 503 && attempt == maxAttempts - 1 && !STABLE_FALLBACK_MODEL.equals(currentModel)) {
+                        BazarMod.LOGGER.info("Switching fallback attempt to stable model: {}", STABLE_FALLBACK_MODEL);
+                        currentModel = STABLE_FALLBACK_MODEL;
+                    }
+
+                    Thread.sleep(1500L * attempt);
+                    continue;
+                }
+
+                return response;
+            } catch (Exception e) {
+                lastException = e;
+                if (attempt < maxAttempts) {
+                    BazarMod.LOGGER.warn("Gemini API network error ({}) on attempt {}/{}, retrying...",
+                            e.getClass().getSimpleName(), attempt, maxAttempts);
+                    try {
+                        Thread.sleep(1500L * attempt);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw e;
+                    }
+                }
+            }
+        }
+
+        if (lastResponse != null) {
+            return lastResponse;
+        }
+        throw lastException != null ? lastException : new RuntimeException("Unknown Gemini connection failure");
+    }
 
     public static CompletableFuture<ConnectionTestResult> testConnectionAsync(
             String rawApiKey,
@@ -35,7 +139,7 @@ public class GeminiJudgeClient {
             int proxyPort
     ) {
         String apiKey = rawApiKey == null ? "" : rawApiKey.trim();
-        String model = (rawModel == null || rawModel.isBlank()) ? "gemini-2.5-flash" : rawModel.trim();
+        String model = (rawModel == null || rawModel.isBlank()) ? STABLE_FALLBACK_MODEL : rawModel.trim();
         String proxyHost = rawProxyHost == null ? "" : rawProxyHost.trim();
 
         if (apiKey.isEmpty()) {
@@ -47,14 +151,7 @@ public class GeminiJudgeClient {
         return CompletableFuture.supplyAsync(() -> {
             long startMs = System.currentTimeMillis();
             try {
-                HttpClient.Builder clientBuilder = HttpClient.newBuilder()
-                        .connectTimeout(Duration.ofSeconds(8));
-
-                if (!proxyHost.isEmpty() && proxyPort > 0) {
-                    clientBuilder.proxy(ProxySelector.of(new InetSocketAddress(proxyHost, proxyPort)));
-                }
-
-                HttpClient client = clientBuilder.build();
+                HttpClient client = getSharedClient(proxyHost, proxyPort);
 
                 JsonObject textPart = new JsonObject();
                 textPart.addProperty("text", "Ответь одним словом: ОК");
@@ -76,17 +173,14 @@ public class GeminiJudgeClient {
                 requestBody.add("contents", contents);
                 requestBody.add("generationConfig", genConfig);
 
-                String url = "https://generativelanguage.googleapis.com/v1beta/models/"
-                        + model + ":generateContent?key=" + apiKey;
-
-                HttpRequest request = HttpRequest.newBuilder()
-                        .uri(URI.create(url))
-                        .timeout(Duration.ofSeconds(12))
-                        .header("Content-Type", "application/json; charset=UTF-8")
-                        .POST(HttpRequest.BodyPublishers.ofString(GSON.toJson(requestBody), StandardCharsets.UTF_8))
-                        .build();
-
-                HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+                HttpResponse<String> response = sendWithRetries(
+                        client,
+                        apiKey,
+                        model,
+                        GSON.toJson(requestBody),
+                        3,
+                        Duration.ofSeconds(30)
+                );
                 long elapsedMs = System.currentTimeMillis() - startMs;
 
                 if (response.statusCode() == 200) {
@@ -104,14 +198,7 @@ public class GeminiJudgeClient {
                     return new ConnectionTestResult(true, "✅ Связь есть! (" + elapsedMs + " мс) Ответ: " + reply);
                 }
 
-                String apiErrMsg = "HTTP " + response.statusCode();
-                try {
-                    JsonObject errJson = JsonParser.parseString(response.body()).getAsJsonObject();
-                    if (errJson.has("error") && errJson.getAsJsonObject("error").has("message")) {
-                        apiErrMsg = response.statusCode() + ": " + errJson.getAsJsonObject("error").get("message").getAsString();
-                    }
-                } catch (Exception ignored) {}
-
+                String apiErrMsg = extractApiErrorMessage(response.statusCode(), response.body());
                 if (apiErrMsg.length() > 64) {
                     apiErrMsg = apiErrMsg.substring(0, 61) + "...";
                 }
@@ -223,14 +310,7 @@ public class GeminiJudgeClient {
     ) {
         return CompletableFuture.supplyAsync(() -> {
             try {
-                HttpClient.Builder clientBuilder = HttpClient.newBuilder()
-                        .connectTimeout(Duration.ofSeconds(10));
-
-                if (!cfg.proxyHost.isBlank() && cfg.proxyPort > 0) {
-                    clientBuilder.proxy(ProxySelector.of(new InetSocketAddress(cfg.proxyHost, cfg.proxyPort)));
-                }
-
-                HttpClient client = clientBuilder.build();
+                HttpClient client = getSharedClient(cfg.proxyHost, cfg.proxyPort);
 
                 JsonObject textPart = new JsonObject();
                 textPart.addProperty("text", prompt);
@@ -262,26 +342,26 @@ public class GeminiJudgeClient {
                 requestBody.add("contents", contents);
                 requestBody.add("generationConfig", genConfig);
 
-                String url = "https://generativelanguage.googleapis.com/v1beta/models/"
-                        + cfg.model + ":generateContent?key=" + cfg.apiKey;
+                String model = (cfg.model == null || cfg.model.isBlank()) ? STABLE_FALLBACK_MODEL : cfg.model.trim();
+                HttpResponse<String> response = sendWithRetries(
+                        client,
+                        cfg.apiKey.trim(),
+                        model,
+                        GSON.toJson(requestBody),
+                        3,
+                        Duration.ofSeconds(60)
+                );
 
-                HttpRequest request = HttpRequest.newBuilder()
-                        .uri(URI.create(url))
-                        .timeout(Duration.ofSeconds(25))
-                        .header("Content-Type", "application/json; charset=UTF-8")
-                        .POST(HttpRequest.BodyPublishers.ofString(GSON.toJson(requestBody), StandardCharsets.UTF_8))
-                        .build();
-
-                HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
                 if (response.statusCode() != 200) {
                     BazarMod.LOGGER.error("Gemini API error ({}): {}", response.statusCode(), response.body());
+                    String errDetail = extractApiErrorMessage(response.statusCode(), response.body());
                     return new JudgeVerdict(
                             false,
                             0,
                             List.of(),
                             fallbackTranscriptOrNull != null ? fallbackTranscriptOrNull : "[Ошибка сети]",
                             "Нет связи с судьёй",
-                            "Смотрящий не дозвонился до центра (Ошибка API " + response.statusCode() + "). Проверь ключ или прокси, бля!",
+                            "Смотрящий не дозвонился до центра (" + errDetail + "). Попробуй ещё раз через пару секунд!",
                             "Чё, связь отрубили? Расходимся нахуй!"
                     );
                 }
@@ -328,7 +408,7 @@ public class GeminiJudgeClient {
                         List.of(),
                         fallbackTranscriptOrNull != null ? fallbackTranscriptOrNull : "[Ошибка запроса]",
                         "Сбой связи",
-                        "Сбой связи со Смотрящим: " + e.getClass().getSimpleName(),
+                        "Сбой связи со Смотрящим (" + e.getClass().getSimpleName() + "). Проверь интернет или прокси!",
                         "Технические шоколадки, братан!"
                 );
             }

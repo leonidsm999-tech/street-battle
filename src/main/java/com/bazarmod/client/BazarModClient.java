@@ -139,7 +139,7 @@ public class BazarModClient implements ClientModInitializer {
                     micRecordingStarted = true;
                     phase = BattlePhase.EVALUATING;
                     phaseStartMs = System.currentTimeMillis();
-                    phaseEndMs = phaseStartMs + 18000L;
+                    phaseEndMs = phaseStartMs + 70000L;
                     MinecraftClient mc = MinecraftClient.getInstance();
                     stopBattleMusic(mc);
                     ClientPlayNetworking.send(new BazarNetworking.SubmitTextPayload(activeShowdownId, trimmed));
@@ -267,7 +267,7 @@ public class BazarModClient implements ClientModInitializer {
                 if (phase == BattlePhase.PLAYER_ROUND) {
                     phase = BattlePhase.EVALUATING;
                     phaseStartMs = System.currentTimeMillis();
-                    phaseEndMs = phaseStartMs + 18000L;
+                    phaseEndMs = phaseStartMs + 70000L;
                 }
                 stopBattleMusic(client);
                 if (sessionId != null) {
