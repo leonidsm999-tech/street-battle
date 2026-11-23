@@ -194,7 +194,7 @@ public class BazarStructures {
             }
         }
         for (int dx = -1; dx <= 1; dx++) {
-            setBlock(world, bounds, origin.add(dx, 3, 0), Blocks.GRAY_CONCRETE_SLAB.getDefaultState());
+            setBlock(world, bounds, origin.add(dx, 3, 0), Blocks.SMOOTH_STONE_SLAB.getDefaultState());
         }
 
         // Entrance doorway (open archway at x=0, z=-1, y=0..1) + Lantern
