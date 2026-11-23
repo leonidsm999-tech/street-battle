@@ -55,19 +55,25 @@ public class BazarMod implements ModInitializer {
         public UUID helperPlayerId = null;
         public final UUID targetMobId;
         public final int targetEntityId;
+        public final String mobTypeKey;
+        public final int tier;
         public final String mobName;
         public final List<String> mobDissLines;
         public final List<String> promptWords;
+        public final int effectiveWinThreshold;
         public final long createdTick;
         public boolean evaluating = false;
 
-        public ShowdownSession(UUID primaryPlayerId, LivingEntity target, BazarDictionary.PromptBundle bundle, long createdTick) {
+        public ShowdownSession(UUID primaryPlayerId, LivingEntity target, BazarDictionary.PromptBundle bundle, int effectiveWinThreshold, long createdTick) {
             this.primaryPlayerId = primaryPlayerId;
             this.targetMobId = target.getUuid();
             this.targetEntityId = target.getId();
+            this.mobTypeKey = bundle.mobTypeKey();
+            this.tier = bundle.tier();
             this.mobName = target.getName().getString();
             this.mobDissLines = bundle.mobDissLines();
             this.promptWords = bundle.words();
+            this.effectiveWinThreshold = effectiveWinThreshold;
             this.createdTick = createdTick;
         }
     }
@@ -77,9 +83,10 @@ public class BazarMod implements ModInitializer {
         Registry.register(Registries.SOUND_EVENT, BATTLE_THEME_ID, BATTLE_THEME_EVENT);
         BazarConfig.get();
         BazarDictionary.ensureLoaded();
+        BazarProgressionManager.ensureLoaded();
         BazarNetworking.registerPayloads();
 
-        // Intercept mob attacks to launch a street showdown
+        // Intercept mob attacks to launch a street showdown (unless mob type already fears the player!)
         AttackEntityCallback.EVENT.register((player, world, hand, entity, hitResult) -> {
             if (world.isClient || hand != Hand.MAIN_HAND) {
                 return ActionResult.PASS;
@@ -99,6 +106,25 @@ public class BazarMod implements ModInitializer {
 
             if (isPlayerInShowdown(serverPlayer.getUuid()) || isMobInShowdown(target.getUuid())) {
                 return ActionResult.FAIL;
+            }
+
+            // Check progression domination: if player maxed out wins against this mob type, they are terrified!
+            int tier = BazarDictionary.resolveTier(target);
+            String mobKey = Registries.ENTITY_TYPE.getId(target.getType()).getPath();
+            if (BazarProgressionManager.isMobTypeDominated(serverPlayer.getUuid(), mobKey, tier)) {
+                IMMUNE_UNTIL_TICK.put(target.getUuid(), now + 200L);
+                serverPlayer.sendMessage(Text.literal("😱 " + target.getName().getString() + " в ужасе от твоего авторитета и откупается без базара!")
+                        .formatted(Formatting.AQUA), true);
+                if (world instanceof ServerWorld sw) {
+                    sw.spawnParticles(ParticleTypes.SMOKE, target.getX(), target.getY() + 1.0, target.getZ(), 15, 0.4, 0.4, 0.4, 0.05);
+                    if (new Random().nextFloat() < 0.35f) {
+                        sw.spawnEntity(new ItemEntity(sw, target.getX(), target.getY() + 0.5, target.getZ(), new ItemStack(Items.EMERALD, 1)));
+                    }
+                }
+                Vec3d flee = target.getPos().subtract(serverPlayer.getPos()).normalize().multiply(1.3);
+                target.addVelocity(flee.x, 0.35, flee.z);
+                target.velocityModified = true;
+                return ActionResult.PASS; // allow normal hit without forcing a battle
             }
 
             startShowdown(serverPlayer, target);
@@ -133,6 +159,7 @@ public class BazarMod implements ModInitializer {
                         session.mobName,
                         fullDiss,
                         session.promptWords,
+                        session.effectiveWinThreshold,
                         payload.wavData()
                 ).thenAccept(verdict -> server.execute(() -> finishShowdown(server, session, verdict)));
             });
@@ -153,6 +180,10 @@ public class BazarMod implements ModInitializer {
                 int halfWords = Math.max(1, session.promptWords.size() / 2);
                 List<String> helperWords = session.promptWords.subList(halfWords, session.promptWords.size());
 
+                BazarProgressionManager.PlayerProgress hp = BazarProgressionManager.get(helper.getUuid());
+                int curWins = BazarProgressionManager.getMobWins(helper.getUuid(), session.mobTypeKey);
+                int reqWins = BazarProgressionManager.getRequiredWinsForTier(session.tier);
+
                 ServerPlayNetworking.send(helper, new BazarNetworking.StartShowdownPayload(
                         session.id,
                         session.targetEntityId,
@@ -160,7 +191,11 @@ public class BazarMod implements ModInitializer {
                         session.mobDissLines,
                         new ArrayList<>(helperWords),
                         Math.max(5, BazarConfig.get().battleDurationSec / 2),
-                        true
+                        true,
+                        curWins,
+                        reqWins,
+                        BazarProgressionManager.getRankTitle(hp.respectXp),
+                        hp.respectXp
                 ));
 
                 ServerPlayerEntity primary = server.getPlayerManager().getPlayer(session.primaryPlayerId);
@@ -200,7 +235,7 @@ public class BazarMod implements ModInitializer {
             Iterator<Map.Entry<UUID, ShowdownSession>> it = ACTIVE_SHOWDOWNS.entrySet().iterator();
             while (it.hasNext()) {
                 ShowdownSession session = it.next().getValue();
-                if (now - session.createdTick > 20L * 55) { // 55s safety timeout (5s diss + 30s talk + 20s API)
+                if (now - session.createdTick > 20L * 55) {
                     it.remove();
                     continue;
                 }
@@ -217,7 +252,7 @@ public class BazarMod implements ModInitializer {
             }
         });
 
-        // Commands: /bazar test, /bazar config, /bazar reload
+        // Commands: /bazar test, /bazar config, /bazar history, /bazar rank, /bazar reload
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> registerCommands(dispatcher));
     }
 
@@ -247,7 +282,22 @@ public class BazarMod implements ModInitializer {
                 }))
                 .then(CommandManager.literal("config").executes(ctx -> {
                     ServerPlayerEntity player = ctx.getSource().getPlayerOrThrow();
-                    ServerPlayNetworking.send(player, new BazarNetworking.OpenConfigPayload(true));
+                    ServerPlayNetworking.send(player, new BazarNetworking.OpenScreenPayload("config"));
+                    return 1;
+                }))
+                .then(CommandManager.literal("history").executes(ctx -> {
+                    ServerPlayerEntity player = ctx.getSource().getPlayerOrThrow();
+                    ServerPlayNetworking.send(player, new BazarNetworking.OpenScreenPayload("history"));
+                    return 1;
+                }))
+                .then(CommandManager.literal("rank").executes(ctx -> {
+                    ServerPlayerEntity player = ctx.getSource().getPlayerOrThrow();
+                    BazarProgressionManager.PlayerProgress prog = BazarProgressionManager.get(player.getUuid());
+                    String rank = BazarProgressionManager.getRankTitle(prog.respectXp);
+                    player.sendMessage(Text.literal("👑 Твой уличный ранг: ")
+                            .formatted(Formatting.GOLD)
+                            .append(Text.literal(rank).formatted(Formatting.AQUA, Formatting.BOLD))
+                            .append(Text.literal(" (" + prog.respectXp + " XP | Побед: " + prog.totalWins + ", Поражений: " + prog.totalLosses + ")").formatted(Formatting.GRAY)), false);
                     return 1;
                 }))
                 .then(CommandManager.literal("reload").executes(ctx -> {
@@ -262,8 +312,15 @@ public class BazarMod implements ModInitializer {
         BazarConfig cfg = BazarConfig.get();
         ServerWorld world = player.getServerWorld();
 
-        BazarDictionary.PromptBundle bundle = BazarDictionary.generateFor(target);
-        ShowdownSession session = new ShowdownSession(player.getUuid(), target, bundle, world.getTime());
+        String mobKey = Registries.ENTITY_TYPE.getId(target.getType()).getPath();
+        int curWins = BazarProgressionManager.getMobWins(player.getUuid(), mobKey);
+        BazarDictionary.PromptBundle bundle = BazarDictionary.generateFor(target, curWins);
+        int reqWins = BazarProgressionManager.getRequiredWinsForTier(bundle.tier());
+
+        // Each prior win against this mob type makes the next one slightly stricter (+5 threshold)
+        int effectiveThreshold = Math.min(85, cfg.minWinScore + (curWins * 5));
+
+        ShowdownSession session = new ShowdownSession(player.getUuid(), target, bundle, effectiveThreshold, world.getTime());
         ACTIVE_SHOWDOWNS.put(session.id, session);
 
         int freezeTicks = (cfg.battleDurationSec + 8) * 20;
@@ -271,10 +328,7 @@ public class BazarMod implements ModInitializer {
         target.addStatusEffect(new StatusEffectInstance(StatusEffects.RESISTANCE, freezeTicks, 255, false, false));
         world.spawnParticles(ParticleTypes.CAMPFIRE_COSY_SMOKE, target.getX(), target.getY() + 1.0, target.getZ(), 25, 0.7, 0.5, 0.7, 0.02);
 
-        String fullDiss = String.join(" ", session.mobDissLines);
-        player.sendMessage(Text.literal("🔥 СТРЕЛКА С ").formatted(Formatting.GOLD, Formatting.BOLD)
-                .append(Text.literal(session.mobName).formatted(Formatting.RED, Formatting.BOLD))
-                .append(Text.literal(": «" + fullDiss + "»").formatted(Formatting.YELLOW)), false);
+        BazarProgressionManager.PlayerProgress prog = BazarProgressionManager.get(player.getUuid());
 
         ServerPlayNetworking.send(player, new BazarNetworking.StartShowdownPayload(
                 session.id,
@@ -283,7 +337,11 @@ public class BazarMod implements ModInitializer {
                 session.mobDissLines,
                 session.promptWords,
                 cfg.battleDurationSec,
-                false
+                false,
+                curWins,
+                reqWins,
+                BazarProgressionManager.getRankTitle(prog.respectXp),
+                prog.respectXp
         ));
 
         // Invite nearby friend within 12 blocks
@@ -314,13 +372,30 @@ public class BazarMod implements ModInitializer {
             IMMUNE_UNTIL_TICK.put(mob.getUuid(), world.getTime() + 100L);
         }
 
+        BazarProgressionManager.BattleOutcomeUpdate progUpdate = BazarProgressionManager.recordBattle(
+                player.getUuid(),
+                session.mobTypeKey,
+                session.tier,
+                verdict.win(),
+                verdict.score()
+        );
+
         BazarNetworking.ShowdownResultPayload resultPayload = new BazarNetworking.ShowdownResultPayload(
                 verdict.win(),
                 verdict.score(),
                 session.promptWords,
                 verdict.usedWords(),
+                verdict.playerTranscript(),
+                verdict.bestPunch(),
                 verdict.judgeComment(),
-                verdict.mobReaction()
+                verdict.mobReaction(),
+                progUpdate.xpGained(),
+                progUpdate.totalXp(),
+                progUpdate.newRank(),
+                progUpdate.rankUp(),
+                progUpdate.mobWinsAfter(),
+                progUpdate.mobWinsRequired(),
+                progUpdate.newlyDominated()
         );
         ServerPlayNetworking.send(player, resultPayload);
 
@@ -329,23 +404,33 @@ public class BazarMod implements ModInitializer {
             ServerPlayNetworking.send(helper, resultPayload);
         }
 
-        if (verdict.win()) {
-            player.sendMessage(Text.literal("✅ ПОБЕДА В БАЗАРЕ (" + verdict.score() + "/100)! ").formatted(Formatting.GREEN, Formatting.BOLD)
-                    .append(Text.literal(verdict.judgeComment()).formatted(Formatting.WHITE)), false);
+        if (progUpdate.rankUp()) {
+            player.sendMessage(Text.literal("👑 ПОВЫШЕНИЕ РАНГА! Теперь ты: ").formatted(Formatting.GOLD, Formatting.BOLD)
+                    .append(Text.literal(progUpdate.newRank()).formatted(Formatting.AQUA, Formatting.BOLD)), false);
+            world.playSound(null, player.getBlockPos(), SoundEvents.ENTITY_PLAYER_LEVELUP, SoundCategory.PLAYERS, 1.0f, 1.0f);
+        }
 
-            player.addStatusEffect(new StatusEffectInstance(StatusEffects.SPEED, 600, 1));
-            player.addStatusEffect(new StatusEffectInstance(StatusEffects.STRENGTH, 600, 0));
+        if (progUpdate.newlyDominated()) {
+            player.sendMessage(Text.literal("🔥 ДОМИНАЦИЯ! Все мобы типа [" + session.mobName + "] теперь боятся тебя и будут убегать без боя!")
+                    .formatted(Formatting.LIGHT_PURPLE, Formatting.BOLD), false);
+        }
+
+        if (verdict.win()) {
+            int rankLvl = BazarProgressionManager.getRankLevel(progUpdate.totalXp());
+            player.addStatusEffect(new StatusEffectInstance(StatusEffects.SPEED, 600 + rankLvl * 100, rankLvl >= 2 ? 1 : 0));
+            player.addStatusEffect(new StatusEffectInstance(StatusEffects.STRENGTH, 600 + rankLvl * 100, rankLvl >= 4 ? 1 : 0));
+            if (rankLvl >= 4) {
+                player.addStatusEffect(new StatusEffectInstance(StatusEffects.LUCK, 1200, 0));
+            }
             world.playSound(null, player.getBlockPos(), SoundEvents.UI_TOAST_CHALLENGE_COMPLETE, SoundCategory.PLAYERS, 1.0f, 1.0f);
 
             if (mob != null) {
                 world.spawnParticles(ParticleTypes.TOTEM_OF_UNDYING, mob.getX(), mob.getY() + 1.0, mob.getZ(), 40, 0.5, 0.8, 0.5, 0.2);
-                world.spawnEntity(new ItemEntity(world, mob.getX(), mob.getY() + 0.5, mob.getZ(), new ItemStack(Items.EMERALD, 1 + new Random().nextInt(2))));
+                int emeraldBonus = (rankLvl >= 3 ? 2 : 1) + new Random().nextInt(2);
+                world.spawnEntity(new ItemEntity(world, mob.getX(), mob.getY() + 0.5, mob.getZ(), new ItemStack(Items.EMERALD, emeraldBonus)));
                 mob.damage(world.getDamageSources().playerAttack(player), 9999.0f);
             }
         } else {
-            player.sendMessage(Text.literal("❌ ТЕБЯ ПЕРЕБАЗАРИЛИ (" + verdict.score() + "/100)! ").formatted(Formatting.RED, Formatting.BOLD)
-                    .append(Text.literal(verdict.judgeComment()).formatted(Formatting.GRAY)), false);
-
             player.addStatusEffect(new StatusEffectInstance(StatusEffects.GLOWING, 900, 0));
             player.addStatusEffect(new StatusEffectInstance(StatusEffects.WEAKNESS, 600, 0));
             world.playSound(null, player.getBlockPos(), SoundEvents.ENTITY_VILLAGER_NO, SoundCategory.PLAYERS, 1.2f, 0.8f);

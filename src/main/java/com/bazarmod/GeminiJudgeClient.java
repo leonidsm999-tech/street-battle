@@ -18,6 +18,8 @@ public class GeminiJudgeClient {
             boolean win,
             int score,
             List<String> usedWords,
+            String playerTranscript,
+            String bestPunch,
             String judgeComment,
             String mobReaction
     ) {}
@@ -28,12 +30,13 @@ public class GeminiJudgeClient {
             String mobName,
             String mobClaim,
             List<String> requiredWords,
+            int effectiveWinThreshold,
             byte[] wavData
     ) {
         BazarConfig cfg = BazarConfig.get();
 
         if (cfg.mockMode || cfg.apiKey == null || cfg.apiKey.isBlank()) {
-            return CompletableFuture.completedFuture(buildFallbackVerdict(cfg, requiredWords));
+            return CompletableFuture.completedFuture(buildFallbackVerdict(cfg, effectiveWinThreshold, requiredWords));
         }
 
         return CompletableFuture.supplyAsync(() -> {
@@ -48,28 +51,30 @@ public class GeminiJudgeClient {
                 HttpClient client = clientBuilder.build();
 
                 String prompt = String.format(
-                        "Ты — жёсткий, беспристрастный «Смотрящий» (пахан и судья уличных и тюремных разборок) в мире Minecraft.\n" +
+                        "Ты — харизматичный и едкий «Смотрящий» (судья дворовых и пацанских словесных разборок) в мире Minecraft.\n" +
                         "Игрок схлестнулся на стрелке с мобом (%s), который кинул ему предъяву: «%s».\n" +
-                        "У игрока было %d секунд, чтобы «перебазарить» моба по воровским и пацанским понятиям, используя обязательные слова из суфлера: [%s].\n\n" +
-                        "Прослушай аудиозапись ответа игрока и оцени его по 3 критериям:\n" +
-                        "1. Напор, дерзость и уверенность в голосе (не зассал ли, не мямлил ли, не извинялся ли, давил ли как настоящий пахан).\n" +
-                        "2. Использование слов из суфлера (сколько слов из списка игрок реально произнес и насколько угарно вплел в речь; учитывай склонения).\n" +
-                        "3. Жёсткость, юмор и креатив наезда (насколько смешно и унизительно он опустил моба).\n\n" +
-                        "Если на записи тишина, блеяние или неуверенное мямленье — ставь низкий балл (5-25) и win=false.\n" +
-                        "Отвечай живым дворовым, тюремным и воровским слэнгом (допускается лёгкий мат для колорита, как в угарных стримах).\n" +
+                        "У игрока было %d секунд, чтобы «перебазарить» моба по-пацански, используя обязательные слова из суфлера: [%s].\n\n" +
+                        "Прослушай аудиозапись ответа игрока и сделай подробный разбор баттла по 3 критериям:\n" +
+                        "1. Напор, уверенность и подача (не замямлил ли, не зассал ли, уверенно ли давил голосом).\n" +
+                        "2. Использование слов из суфлера (какие слова из списка игрок реально произнес; учитывай склонения и падежи).\n" +
+                        "3. Юмор, острота ответа на предъяву моба и креативность наезда.\n\n" +
+                        "Если на записи тишина или невнятное мычание — ставь низкий балл (5-25) и win=false.\n" +
+                        "Пиши живым дворовым пацанским языком с лёгким матом для угара (без лишней тюремной перегрузки).\n" +
                         "Верни ответ СТРОГО в формате JSON со следующими полями:\n" +
                         "{\n" +
-                        "  \"win\": boolean (true если авторитет >= %d, иначе false),\n" +
+                        "  \"win\": boolean (true если score >= %d, иначе false),\n" +
                         "  \"score\": integer (от 0 до 100),\n" +
+                        "  \"player_transcript\": \"Точная расшифровка того, что игрок сказал в микрофон (если тишина — напиши '[Тишина / неразборчиво]')\",\n" +
                         "  \"used_words\": [\"список слов из суфлера, которые игрок реально сказал\"],\n" +
-                        "  \"judge_comment\": \"Короткий (1-2 предложения) едкий комментарий Смотрящего в блатном/дворовом стиле с оценкой его базара\",\n" +
-                        "  \"mob_reaction\": \"Короткая (1 предложение) финальная фраза моба перед тем как слиться или пробить игроку в щи\"\n" +
+                        "  \"best_punch\": \"Самая удачная фраза/панч игрока за раунд (или главная причина провала, если он затупил)\",\n" +
+                        "  \"judge_comment\": \"Разбор баттла (2-3 предложения): разбери подачу, как он ответил на предъяву моба и как вплёл слова\",\n" +
+                        "  \"mob_reaction\": \"Короткая (1 предложение) финальная фраза моба перед тем как слиться или ударить игрока\"\n" +
                         "}",
                         mobName,
                         mobClaim,
                         cfg.battleDurationSec,
                         String.join(", ", requiredWords),
-                        cfg.minWinScore
+                        effectiveWinThreshold
                 );
 
                 String base64Audio = Base64.getEncoder().encodeToString(wavData);
@@ -96,7 +101,7 @@ public class GeminiJudgeClient {
 
                 JsonObject genConfig = new JsonObject();
                 genConfig.addProperty("responseMimeType", "application/json");
-                genConfig.addProperty("temperature", 0.95);
+                genConfig.addProperty("temperature", 0.9);
 
                 JsonObject requestBody = new JsonObject();
                 requestBody.add("contents", contents);
@@ -119,6 +124,8 @@ public class GeminiJudgeClient {
                             false,
                             0,
                             List.of(),
+                            "[Ошибка сети]",
+                            "Нет связи с судьёй",
                             "Смотрящий не дозвонился до центра (Ошибка API " + response.statusCode() + "). Проверь ключ или прокси!",
                             "Чё, связь отрубили? Расходимся!"
                     );
@@ -136,21 +143,27 @@ public class GeminiJudgeClient {
                 JsonObject verdictJson = JsonParser.parseString(rawText).getAsJsonObject();
 
                 int score = verdictJson.has("score") ? verdictJson.get("score").getAsInt() : 0;
-                boolean win = verdictJson.has("win") ? verdictJson.get("win").getAsBoolean() : (score >= cfg.minWinScore);
+                boolean win = verdictJson.has("win") ? verdictJson.get("win").getAsBoolean() : (score >= effectiveWinThreshold);
 
                 List<String> used = new ArrayList<>();
                 if (verdictJson.has("used_words") && verdictJson.get("used_words").isJsonArray()) {
                     verdictJson.getAsJsonArray("used_words").forEach(el -> used.add(el.getAsString()));
                 }
 
+                String transcript = verdictJson.has("player_transcript")
+                        ? verdictJson.get("player_transcript").getAsString()
+                        : "[Расшифровка недоступна]";
+                String bestPunch = verdictJson.has("best_punch")
+                        ? verdictJson.get("best_punch").getAsString()
+                        : "Без ярких панчей";
                 String comment = verdictJson.has("judge_comment")
                         ? verdictJson.get("judge_comment").getAsString()
-                        : "Базар принят по понятиям.";
+                        : "Базар принят к сведению.";
                 String reaction = verdictJson.has("mob_reaction")
                         ? verdictJson.get("mob_reaction").getAsString()
-                        : (win ? "Всё-всё, братан, рамсы попутал, ухожу..." : "Слабовато кукарекаешь, держи в щи!");
+                        : (win ? "Ладно, братан, вопросов больше не имею..." : "Слабовато для нашего района!");
 
-                return new JudgeVerdict(win, score, used, comment, reaction);
+                return new JudgeVerdict(win, score, used, transcript, bestPunch, comment, reaction);
 
             } catch (Exception e) {
                 BazarMod.LOGGER.error("Failed to call Gemini API", e);
@@ -158,6 +171,8 @@ public class GeminiJudgeClient {
                         false,
                         0,
                         List.of(),
+                        "[Ошибка запроса]",
+                        "Сбой связи",
                         "Сбой связи со Смотрящим: " + e.getClass().getSimpleName(),
                         "Технические шоколадки, братан!"
                 );
@@ -165,25 +180,29 @@ public class GeminiJudgeClient {
         });
     }
 
-    private static JudgeVerdict buildFallbackVerdict(BazarConfig cfg, List<String> words) {
+    private static JudgeVerdict buildFallbackVerdict(BazarConfig cfg, int threshold, List<String> words) {
         if (!cfg.mockMode) {
             return new JudgeVerdict(
                     false,
                     0,
                     List.of(),
+                    "[API ключ не задан]",
+                    "Нет ключа",
                     "Не задан api_key! Нажми [K] в игре и впиши ключ Gemini (или включи тестовый режим).",
-                    "Без ключа малява не принимается!"
+                    "Без ключа базар не принимается!"
             );
         }
-        int score = 40 + new Random().nextInt(55);
-        boolean win = score >= cfg.minWinScore;
+        int score = 45 + new Random().nextInt(50);
+        boolean win = score >= threshold;
         List<String> used = words.subList(0, Math.min(2, words.size()));
         return new JudgeVerdict(
                 win,
                 score,
                 used,
-                "[ТЕСТ] Напор чёткий, слова вплёл как по маслу, чисто ровный пацан!",
-                win ? "Всё-всё, понял, ухожу под шконку..." : "Не вывез ты базар, держи леща!"
+                "[Тестовый режим — запись микрофона не отправлялась в API]",
+                "«Поясни за свой биом, пока я тут порядок не навёл!»",
+                "[ТЕСТ] Напор уверенный, слова из суфлера вплёл по красоте, предъяву отбил чётко.",
+                win ? "Всё-всё, понял, ухожу без вопросов..." : "Не вывез ты базар, держи леща!"
         );
     }
 

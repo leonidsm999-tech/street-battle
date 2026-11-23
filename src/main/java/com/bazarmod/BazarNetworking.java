@@ -28,7 +28,7 @@ public class BazarNetworking {
         return list;
     }
 
-    // S2C: Start showdown on client (includes mobEntityId for 3D render & multi-line diss)
+    // S2C: Start showdown on client (includes mob progression info)
     public record StartShowdownPayload(
             UUID showdownId,
             int mobEntityId,
@@ -36,7 +36,11 @@ public class BazarNetworking {
             List<String> mobDissLines,
             List<String> promptWords,
             int durationSec,
-            boolean isHelper
+            boolean isHelper,
+            int mobCurrentWins,
+            int mobRequiredWins,
+            String playerRank,
+            int playerXp
     ) implements CustomPayload {
         public static final Id<StartShowdownPayload> ID = new Id<>(Identifier.of(BazarMod.MOD_ID, "start_showdown"));
         public static final PacketCodec<RegistryByteBuf, StartShowdownPayload> CODEC = PacketCodec.ofStatic(
@@ -48,6 +52,10 @@ public class BazarNetworking {
                     writeStringList(buf, payload.promptWords);
                     buf.writeVarInt(payload.durationSec);
                     buf.writeBoolean(payload.isHelper);
+                    buf.writeVarInt(payload.mobCurrentWins);
+                    buf.writeVarInt(payload.mobRequiredWins);
+                    buf.writeString(payload.playerRank);
+                    buf.writeVarInt(payload.playerXp);
                 },
                 buf -> new StartShowdownPayload(
                         buf.readUuid(),
@@ -56,7 +64,11 @@ public class BazarNetworking {
                         readStringList(buf),
                         readStringList(buf),
                         buf.readVarInt(),
-                        buf.readBoolean()
+                        buf.readBoolean(),
+                        buf.readVarInt(),
+                        buf.readVarInt(),
+                        buf.readString(),
+                        buf.readVarInt()
                 )
         );
 
@@ -92,14 +104,23 @@ public class BazarNetworking {
         }
     }
 
-    // S2C: Showdown result from AI judge
+    // S2C: Showdown result + detailed breakdown + progression update
     public record ShowdownResultPayload(
             boolean win,
             int score,
             List<String> promptWords,
             List<String> usedWords,
+            String playerTranscript,
+            String bestPunch,
             String judgeComment,
-            String mobReaction
+            String mobReaction,
+            int xpGained,
+            int totalXp,
+            String rankTitle,
+            boolean rankUp,
+            int mobWinsAfter,
+            int mobWinsRequired,
+            boolean newlyDominated
     ) implements CustomPayload {
         public static final Id<ShowdownResultPayload> ID = new Id<>(Identifier.of(BazarMod.MOD_ID, "showdown_result"));
         public static final PacketCodec<RegistryByteBuf, ShowdownResultPayload> CODEC = PacketCodec.ofStatic(
@@ -108,8 +129,17 @@ public class BazarNetworking {
                     buf.writeVarInt(payload.score);
                     writeStringList(buf, payload.promptWords);
                     writeStringList(buf, payload.usedWords);
+                    buf.writeString(payload.playerTranscript);
+                    buf.writeString(payload.bestPunch);
                     buf.writeString(payload.judgeComment);
                     buf.writeString(payload.mobReaction);
+                    buf.writeVarInt(payload.xpGained);
+                    buf.writeVarInt(payload.totalXp);
+                    buf.writeString(payload.rankTitle);
+                    buf.writeBoolean(payload.rankUp);
+                    buf.writeVarInt(payload.mobWinsAfter);
+                    buf.writeVarInt(payload.mobWinsRequired);
+                    buf.writeBoolean(payload.newlyDominated);
                 },
                 buf -> new ShowdownResultPayload(
                         buf.readBoolean(),
@@ -117,7 +147,16 @@ public class BazarNetworking {
                         readStringList(buf),
                         readStringList(buf),
                         buf.readString(),
-                        buf.readString()
+                        buf.readString(),
+                        buf.readString(),
+                        buf.readString(),
+                        buf.readVarInt(),
+                        buf.readVarInt(),
+                        buf.readString(),
+                        buf.readBoolean(),
+                        buf.readVarInt(),
+                        buf.readVarInt(),
+                        buf.readBoolean()
                 )
         );
 
@@ -141,12 +180,12 @@ public class BazarNetworking {
         }
     }
 
-    // S2C: Open config screen on client (triggered by /bazar config)
-    public record OpenConfigPayload(boolean open) implements CustomPayload {
-        public static final Id<OpenConfigPayload> ID = new Id<>(Identifier.of(BazarMod.MOD_ID, "open_config"));
-        public static final PacketCodec<RegistryByteBuf, OpenConfigPayload> CODEC = PacketCodec.ofStatic(
-                (buf, payload) -> buf.writeBoolean(payload.open),
-                buf -> new OpenConfigPayload(buf.readBoolean())
+    // S2C: Open screen on client ("config" or "history")
+    public record OpenScreenPayload(String screenName) implements CustomPayload {
+        public static final Id<OpenScreenPayload> ID = new Id<>(Identifier.of(BazarMod.MOD_ID, "open_screen"));
+        public static final PacketCodec<RegistryByteBuf, OpenScreenPayload> CODEC = PacketCodec.ofStatic(
+                (buf, payload) -> buf.writeString(payload.screenName),
+                buf -> new OpenScreenPayload(buf.readString())
         );
 
         @Override
@@ -232,7 +271,7 @@ public class BazarNetworking {
         PayloadTypeRegistry.playS2C().register(InviteFriendPayload.ID, InviteFriendPayload.CODEC);
         PayloadTypeRegistry.playS2C().register(ShowdownResultPayload.ID, ShowdownResultPayload.CODEC);
         PayloadTypeRegistry.playS2C().register(StopMusicPayload.ID, StopMusicPayload.CODEC);
-        PayloadTypeRegistry.playS2C().register(OpenConfigPayload.ID, OpenConfigPayload.CODEC);
+        PayloadTypeRegistry.playS2C().register(OpenScreenPayload.ID, OpenScreenPayload.CODEC);
 
         PayloadTypeRegistry.playC2S().register(SubmitAudioPayload.ID, SubmitAudioPayload.CODEC);
         PayloadTypeRegistry.playC2S().register(JoinShowdownPayload.ID, JoinShowdownPayload.CODEC);

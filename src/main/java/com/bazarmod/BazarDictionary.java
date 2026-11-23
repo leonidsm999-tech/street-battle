@@ -16,13 +16,17 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class BazarDictionary {
-    public record PromptBundle(int tier, List<String> mobDissLines, List<String> words) {}
+    public record PromptBundle(int tier, String mobTypeKey, List<String> mobDissLines, List<String> words) {}
 
     private static final Map<String, List<List<String>>> MOB_DISSES = new HashMap<>();
     private static final Map<Integer, List<List<String>>> TIER_DISSES = new HashMap<>();
     private static final Map<Integer, List<String>> TIER_WORDS = new HashMap<>();
+
+    // Track recently used diss indices per mob type so mobs never repeat the same phrase twice in a row!
+    private static final Map<String, Deque<Integer>> RECENT_DISS_HISTORY = new ConcurrentHashMap<>();
     private static final Random RANDOM = new Random();
     private static boolean loaded = false;
 
@@ -94,28 +98,59 @@ public class BazarDictionary {
         return 2;
     }
 
-    public static PromptBundle generateFor(LivingEntity entity) {
+    public static PromptBundle generateFor(LivingEntity entity, int mobWinsCount) {
         ensureLoaded();
         int tier = resolveTier(entity);
 
         Identifier typeId = Registries.ENTITY_TYPE.getId(entity.getType());
         String pathKey = typeId.getPath();
 
-        List<List<String>> dissPool = MOB_DISSES.get(pathKey);
-        if (dissPool == null || dissPool.isEmpty()) {
-            dissPool = TIER_DISSES.getOrDefault(tier, List.of(List.of(
-                    "Слышь, ты с какого биома сюда забрёл?",
-                    "Поясни за свой базар, пока не поздно!"
-            )));
+        List<List<String>> dissPool = new ArrayList<>();
+        if (MOB_DISSES.containsKey(pathKey)) {
+            dissPool.addAll(MOB_DISSES.get(pathKey));
+        }
+        // Also mix in tier disses so even after 6 fights the mob still surprises you!
+        if (TIER_DISSES.containsKey(tier)) {
+            dissPool.addAll(TIER_DISSES.get(tier));
+        }
+        if (dissPool.isEmpty()) {
+            dissPool.add(List.of("Слышь, ты с какого биома сюда забрёл?", "Поясни за свой базар, пока не поздно!"));
         }
 
-        List<String> chosenDiss = new ArrayList<>(dissPool.get(RANDOM.nextInt(dissPool.size())));
+        int chosenIdx = pickNonRepeatingIndex(pathKey, dissPool.size());
+        List<String> chosenDiss = new ArrayList<>(dissPool.get(chosenIdx));
 
+        // Build word pool (if mob wins > 0, also pull harder words from next tier!)
         List<String> wordPool = new ArrayList<>(TIER_WORDS.getOrDefault(tier, List.of("поясни", "уважение", "базар")));
+        if (mobWinsCount > 0 && tier < 4 && TIER_WORDS.containsKey(tier + 1)) {
+            wordPool.addAll(TIER_WORDS.get(tier + 1));
+        }
         Collections.shuffle(wordPool, RANDOM);
 
-        int wordCount = Math.min(wordPool.size(), 2 + tier);
+        // Progression increases word count slightly as mob learns your tricks (+1 word per prior win)
+        int wordCount = Math.min(wordPool.size(), 2 + tier + Math.min(2, mobWinsCount));
         List<String> chosenWords = new ArrayList<>(wordPool.subList(0, wordCount));
-        return new PromptBundle(tier, chosenDiss, chosenWords);
+        return new PromptBundle(tier, pathKey, chosenDiss, chosenWords);
+    }
+
+    private static int pickNonRepeatingIndex(String key, int poolSize) {
+        if (poolSize <= 1) return 0;
+        Deque<Integer> recent = RECENT_DISS_HISTORY.computeIfAbsent(key, k -> new ArrayDeque<>());
+        List<Integer> candidates = new ArrayList<>();
+        for (int i = 0; i < poolSize; i++) {
+            if (!recent.contains(i)) {
+                candidates.add(i);
+            }
+        }
+        if (candidates.isEmpty()) {
+            recent.clear();
+            for (int i = 0; i < poolSize; i++) candidates.add(i);
+        }
+        int picked = candidates.get(RANDOM.nextInt(candidates.size()));
+        recent.addLast(picked);
+        while (recent.size() >= Math.max(1, poolSize - 1)) {
+            recent.removeFirst();
+        }
+        return picked;
     }
 }
