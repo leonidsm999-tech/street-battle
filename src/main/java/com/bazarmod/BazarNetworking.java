@@ -28,11 +28,13 @@ public class BazarNetworking {
         return list;
     }
 
-    // S2C: Start showdown on client (includes mob progression info)
+    // S2C: Start showdown on client
     public record StartShowdownPayload(
             UUID showdownId,
             int mobEntityId,
             String mobName,
+            String mobStreetNickname,
+            String tierBadge,
             List<String> mobDissLines,
             List<String> promptWords,
             int durationSec,
@@ -48,6 +50,8 @@ public class BazarNetworking {
                     buf.writeUuid(payload.showdownId);
                     buf.writeVarInt(payload.mobEntityId);
                     buf.writeString(payload.mobName);
+                    buf.writeString(payload.mobStreetNickname);
+                    buf.writeString(payload.tierBadge);
                     writeStringList(buf, payload.mobDissLines);
                     writeStringList(buf, payload.promptWords);
                     buf.writeVarInt(payload.durationSec);
@@ -60,6 +64,8 @@ public class BazarNetworking {
                 buf -> new StartShowdownPayload(
                         buf.readUuid(),
                         buf.readVarInt(),
+                        buf.readString(),
+                        buf.readString(),
                         buf.readString(),
                         readStringList(buf),
                         readStringList(buf),

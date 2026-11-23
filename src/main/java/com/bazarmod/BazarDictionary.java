@@ -19,13 +19,21 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class BazarDictionary {
-    public record PromptBundle(int tier, String mobTypeKey, List<String> mobDissLines, List<String> words) {}
+    public record PromptBundle(
+            int tier,
+            String tierBadge,
+            String mobTypeKey,
+            String mobStreetNickname,
+            List<String> mobDissLines,
+            List<String> words
+    ) {}
 
+    private static final Map<String, String> MOB_NICKNAMES = new HashMap<>();
     private static final Map<String, List<List<String>>> MOB_DISSES = new HashMap<>();
+    private static final Map<Integer, String> TIER_BADGES = new HashMap<>();
     private static final Map<Integer, List<List<String>>> TIER_DISSES = new HashMap<>();
     private static final Map<Integer, List<String>> TIER_WORDS = new HashMap<>();
 
-    // Track recently used diss indices per mob type so mobs never repeat the same phrase twice in a row!
     private static final Map<String, Deque<Integer>> RECENT_DISS_HISTORY = new ConcurrentHashMap<>();
     private static final Random RANDOM = new Random();
     private static boolean loaded = false;
@@ -43,6 +51,9 @@ public class BazarDictionary {
                 JsonObject mobSpec = root.getAsJsonObject("mob_specific");
                 for (Map.Entry<String, JsonElement> entry : mobSpec.entrySet()) {
                     JsonObject obj = entry.getValue().getAsJsonObject();
+                    if (obj.has("nickname")) {
+                        MOB_NICKNAMES.put(entry.getKey(), obj.get("nickname").getAsString());
+                    }
                     if (obj.has("disses")) {
                         MOB_DISSES.put(entry.getKey(), parseDissList(obj.getAsJsonArray("disses")));
                     }
@@ -52,6 +63,9 @@ public class BazarDictionary {
             JsonObject tiers = root.getAsJsonObject("tiers");
             for (int t = 1; t <= 4; t++) {
                 JsonObject tierObj = tiers.getAsJsonObject(String.valueOf(t));
+                if (tierObj.has("badge")) {
+                    TIER_BADGES.put(t, tierObj.get("badge").getAsString());
+                }
                 if (tierObj.has("disses")) {
                     TIER_DISSES.put(t, parseDissList(tierObj.getAsJsonArray("disses")));
                 }
@@ -105,32 +119,35 @@ public class BazarDictionary {
         Identifier typeId = Registries.ENTITY_TYPE.getId(entity.getType());
         String pathKey = typeId.getPath();
 
+        String nickname = entity.hasCustomName() && entity.getCustomName() != null
+                ? entity.getCustomName().getString()
+                : MOB_NICKNAMES.getOrDefault(pathKey, "МС " + entity.getName().getString());
+
+        String tierBadge = TIER_BADGES.getOrDefault(tier, "ДВОРОВЫЙ");
+
         List<List<String>> dissPool = new ArrayList<>();
         if (MOB_DISSES.containsKey(pathKey)) {
             dissPool.addAll(MOB_DISSES.get(pathKey));
         }
-        // Also mix in tier disses so even after 6 fights the mob still surprises you!
         if (TIER_DISSES.containsKey(tier)) {
             dissPool.addAll(TIER_DISSES.get(tier));
         }
         if (dissPool.isEmpty()) {
-            dissPool.add(List.of("Слышь, ты с какого биома сюда забрёл?", "Поясни за свой базар, пока не поздно!"));
+            dissPool.add(List.of("Слышь, фраер, ты с какого биома сюда забрёл?", "Поясни за свой базар, пока не поздно!"));
         }
 
         int chosenIdx = pickNonRepeatingIndex(pathKey, dissPool.size());
         List<String> chosenDiss = new ArrayList<>(dissPool.get(chosenIdx));
 
-        // Build word pool (if mob wins > 0, also pull harder words from next tier!)
         List<String> wordPool = new ArrayList<>(TIER_WORDS.getOrDefault(tier, List.of("поясни", "уважение", "базар")));
         if (mobWinsCount > 0 && tier < 4 && TIER_WORDS.containsKey(tier + 1)) {
             wordPool.addAll(TIER_WORDS.get(tier + 1));
         }
         Collections.shuffle(wordPool, RANDOM);
 
-        // Progression increases word count slightly as mob learns your tricks (+1 word per prior win)
         int wordCount = Math.min(wordPool.size(), 2 + tier + Math.min(2, mobWinsCount));
         List<String> chosenWords = new ArrayList<>(wordPool.subList(0, wordCount));
-        return new PromptBundle(tier, pathKey, chosenDiss, chosenWords);
+        return new PromptBundle(tier, tierBadge, pathKey, nickname, chosenDiss, chosenWords);
     }
 
     private static int pickNonRepeatingIndex(String key, int poolSize) {

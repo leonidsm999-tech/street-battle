@@ -6,12 +6,16 @@ import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.event.player.AttackEntityCallback;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
+import net.minecraft.command.argument.EntityAnchorArgumentType;
+import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityType;
 import net.minecraft.entity.ItemEntity;
 import net.minecraft.entity.LivingEntity;
 import net.minecraft.entity.effect.StatusEffectInstance;
 import net.minecraft.entity.effect.StatusEffects;
+import net.minecraft.entity.mob.MobEntity;
 import net.minecraft.entity.mob.ZombieEntity;
+import net.minecraft.entity.passive.VillagerEntity;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
@@ -31,8 +35,10 @@ import net.minecraft.util.ActionResult;
 import net.minecraft.util.Formatting;
 import net.minecraft.util.Hand;
 import net.minecraft.util.Identifier;
+import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.Heightmap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -49,6 +55,15 @@ public class BazarMod implements ModInitializer {
     private static final Map<UUID, ShowdownSession> ACTIVE_SHOWDOWNS = new ConcurrentHashMap<>();
     private static final Map<UUID, Long> IMMUNE_UNTIL_TICK = new ConcurrentHashMap<>();
 
+    private static final List<String> SPECTATOR_NAMES = List.of(
+            "§6Смотрящий",
+            "§eПацан с района",
+            "§eБраток",
+            "§eСвидетель базара",
+            "§6Авторитет",
+            "§eКент"
+    );
+
     public static class ShowdownSession {
         public final UUID id = UUID.randomUUID();
         public final UUID primaryPlayerId;
@@ -58,10 +73,13 @@ public class BazarMod implements ModInitializer {
         public final String mobTypeKey;
         public final int tier;
         public final String mobName;
+        public final String mobStreetNickname;
+        public final String tierBadge;
         public final List<String> mobDissLines;
         public final List<String> promptWords;
         public final int effectiveWinThreshold;
         public final long createdTick;
+        public final List<UUID> spectatorIds = new ArrayList<>();
         public boolean evaluating = false;
 
         public ShowdownSession(UUID primaryPlayerId, LivingEntity target, BazarDictionary.PromptBundle bundle, int effectiveWinThreshold, long createdTick) {
@@ -71,6 +89,8 @@ public class BazarMod implements ModInitializer {
             this.mobTypeKey = bundle.mobTypeKey();
             this.tier = bundle.tier();
             this.mobName = target.getName().getString();
+            this.mobStreetNickname = bundle.mobStreetNickname();
+            this.tierBadge = bundle.tierBadge();
             this.mobDissLines = bundle.mobDissLines();
             this.promptWords = bundle.words();
             this.effectiveWinThreshold = effectiveWinThreshold;
@@ -86,7 +106,7 @@ public class BazarMod implements ModInitializer {
         BazarProgressionManager.ensureLoaded();
         BazarNetworking.registerPayloads();
 
-        // Intercept mob attacks to launch a street showdown (unless mob type already fears the player!)
+        // Intercept mob attacks to launch a street showdown
         AttackEntityCallback.EVENT.register((player, world, hand, entity, hitResult) -> {
             if (world.isClient || hand != Hand.MAIN_HAND) {
                 return ActionResult.PASS;
@@ -96,6 +116,11 @@ public class BazarMod implements ModInitializer {
             }
             if (!(entity instanceof LivingEntity target) || target instanceof PlayerEntity) {
                 return ActionResult.PASS;
+            }
+
+            // Do not allow hitting spectators during a battle
+            if (isSpectatorEntity(target.getUuid())) {
+                return ActionResult.FAIL;
             }
 
             long now = world.getTime();
@@ -108,7 +133,7 @@ public class BazarMod implements ModInitializer {
                 return ActionResult.FAIL;
             }
 
-            // Check progression domination: if player maxed out wins against this mob type, they are terrified!
+            // Check progression domination
             int tier = BazarDictionary.resolveTier(target);
             String mobKey = Registries.ENTITY_TYPE.getId(target.getType()).getPath();
             if (BazarProgressionManager.isMobTypeDominated(serverPlayer.getUuid(), mobKey, tier)) {
@@ -124,7 +149,7 @@ public class BazarMod implements ModInitializer {
                 Vec3d flee = target.getPos().subtract(serverPlayer.getPos()).normalize().multiply(1.3);
                 target.addVelocity(flee.x, 0.35, flee.z);
                 target.velocityModified = true;
-                return ActionResult.PASS; // allow normal hit without forcing a battle
+                return ActionResult.PASS;
             }
 
             startShowdown(serverPlayer, target);
@@ -156,7 +181,7 @@ public class BazarMod implements ModInitializer {
 
                 String fullDiss = String.join(" ", session.mobDissLines);
                 GeminiJudgeClient.evaluateAsync(
-                        session.mobName,
+                        session.mobStreetNickname,
                         fullDiss,
                         session.promptWords,
                         session.effectiveWinThreshold,
@@ -188,6 +213,8 @@ public class BazarMod implements ModInitializer {
                         session.id,
                         session.targetEntityId,
                         session.mobName,
+                        session.mobStreetNickname,
+                        session.tierBadge,
                         session.mobDissLines,
                         new ArrayList<>(helperWords),
                         Math.max(5, BazarConfig.get().battleDurationSec / 2),
@@ -229,25 +256,39 @@ public class BazarMod implements ModInitializer {
             });
         });
 
-        // Keep combatants frozen during showdown & cleanup stale sessions
+        // Keep combatants & spectators frozen and looking at the center of the battle!
         ServerTickEvents.END_SERVER_TICK.register(server -> {
             long now = server.getOverworld().getTime();
             Iterator<Map.Entry<UUID, ShowdownSession>> it = ACTIVE_SHOWDOWNS.entrySet().iterator();
             while (it.hasNext()) {
                 ShowdownSession session = it.next().getValue();
-                if (now - session.createdTick > 20L * 55) {
-                    it.remove();
-                    continue;
-                }
                 ServerPlayerEntity player = server.getPlayerManager().getPlayer(session.primaryPlayerId);
-                if (player == null) {
+                if (player == null || now - session.createdTick > 20L * 65) {
+                    if (player != null) {
+                        despawnSpectators(player.getServerWorld(), session);
+                    }
                     it.remove();
                     continue;
                 }
+
                 ServerWorld world = player.getServerWorld();
+                Vec3d midPoint = player.getEyePos();
+
                 if (world.getEntity(session.targetMobId) instanceof LivingEntity mob && mob.isAlive()) {
                     mob.addStatusEffect(new StatusEffectInstance(StatusEffects.SLOWNESS, 10, 255, false, false));
                     mob.addStatusEffect(new StatusEffectInstance(StatusEffects.RESISTANCE, 10, 255, false, false));
+                    mob.lookAt(EntityAnchorArgumentType.EntityAnchor.EYES, player.getEyePos());
+                    midPoint = player.getEyePos().add(mob.getEyePos()).multiply(0.5);
+                }
+
+                // Keep spectators watching the showdown
+                for (UUID specId : session.spectatorIds) {
+                    Entity spec = world.getEntity(specId);
+                    if (spec instanceof LivingEntity livingSpec && livingSpec.isAlive()) {
+                        livingSpec.addStatusEffect(new StatusEffectInstance(StatusEffects.SLOWNESS, 10, 255, false, false));
+                        livingSpec.addStatusEffect(new StatusEffectInstance(StatusEffects.RESISTANCE, 10, 255, false, false));
+                        livingSpec.lookAt(EntityAnchorArgumentType.EntityAnchor.EYES, midPoint);
+                    }
                 }
             }
         });
@@ -263,7 +304,7 @@ public class BazarMod implements ModInitializer {
                     ServerWorld world = player.getServerWorld();
                     Box box = player.getBoundingBox().expand(12.0);
                     List<LivingEntity> nearby = world.getEntitiesByClass(LivingEntity.class, box,
-                            e -> e != player && !(e instanceof PlayerEntity) && e.isAlive());
+                            e -> e != player && !(e instanceof PlayerEntity) && !isSpectatorEntity(e.getUuid()) && e.isAlive());
 
                     LivingEntity target;
                     if (!nearby.isEmpty()) {
@@ -271,8 +312,8 @@ public class BazarMod implements ModInitializer {
                     } else {
                         ZombieEntity gopnik = new ZombieEntity(EntityType.ZOMBIE, world);
                         Vec3d look = player.getRotationVec(1.0f);
-                        gopnik.refreshPositionAndAngles(player.getX() + look.x * 3.0, player.getY(), player.getZ() + look.z * 3.0, 0, 0);
-                        gopnik.setCustomName(Text.literal("Дворовый Зомби").formatted(Formatting.RED));
+                        gopnik.refreshPositionAndAngles(player.getX() + look.x * 3.2, player.getY(), player.getZ() + look.z * 3.2, 0, 0);
+                        gopnik.setCustomName(Text.literal("Гнилой Пахан").formatted(Formatting.RED));
                         gopnik.setCustomNameVisible(true);
                         world.spawnEntity(gopnik);
                         target = gopnik;
@@ -317,16 +358,18 @@ public class BazarMod implements ModInitializer {
         BazarDictionary.PromptBundle bundle = BazarDictionary.generateFor(target, curWins);
         int reqWins = BazarProgressionManager.getRequiredWinsForTier(bundle.tier());
 
-        // Each prior win against this mob type makes the next one slightly stricter (+5 threshold)
         int effectiveThreshold = Math.min(85, cfg.minWinScore + (curWins * 5));
 
         ShowdownSession session = new ShowdownSession(player.getUuid(), target, bundle, effectiveThreshold, world.getTime());
         ACTIVE_SHOWDOWNS.put(session.id, session);
 
-        int freezeTicks = (cfg.battleDurationSec + 8) * 20;
+        int freezeTicks = (cfg.battleDurationSec + 15) * 20;
         target.addStatusEffect(new StatusEffectInstance(StatusEffects.SLOWNESS, freezeTicks, 255, false, false));
         target.addStatusEffect(new StatusEffectInstance(StatusEffects.RESISTANCE, freezeTicks, 255, false, false));
-        world.spawnParticles(ParticleTypes.CAMPFIRE_COSY_SMOKE, target.getX(), target.getY() + 1.0, target.getZ(), 25, 0.7, 0.5, 0.7, 0.02);
+        world.spawnParticles(ParticleTypes.CAMPFIRE_COSY_SMOKE, target.getX(), target.getY() + 1.0, target.getZ(), 30, 0.8, 0.5, 0.8, 0.02);
+
+        // Spawn 4 "Смотрящие" (spectators) on both sides of the arena!
+        spawnSpectatorsAroundArena(world, player, target, session);
 
         BazarProgressionManager.PlayerProgress prog = BazarProgressionManager.get(player.getUuid());
 
@@ -334,6 +377,8 @@ public class BazarMod implements ModInitializer {
                 session.id,
                 session.targetEntityId,
                 session.mobName,
+                session.mobStreetNickname,
+                session.tierBadge,
                 session.mobDissLines,
                 session.promptWords,
                 cfg.battleDurationSec,
@@ -351,10 +396,65 @@ public class BazarMod implements ModInitializer {
                 ServerPlayNetworking.send(friend, new BazarNetworking.InviteFriendPayload(
                         session.id,
                         player.getName().getString(),
-                        session.mobName
+                        session.mobStreetNickname
                 ));
             }
         }
+    }
+
+    private void spawnSpectatorsAroundArena(ServerWorld world, ServerPlayerEntity player, LivingEntity target, ShowdownSession session) {
+        Vec3d pPos = player.getPos();
+        Vec3d mPos = target.getPos();
+        Vec3d mid = pPos.add(mPos).multiply(0.5);
+        Vec3d dir = mPos.subtract(pPos);
+        if (dir.lengthSquared() < 0.01) {
+            dir = player.getRotationVec(1.0f);
+        }
+        dir = new Vec3d(dir.x, 0, dir.z).normalize();
+        // Perpendicular vector (left & right sides of the duel!)
+        Vec3d side = new Vec3d(-dir.z, 0, dir.x);
+
+        // 4 positions: 2 on the left side, 2 on the right side
+        Vec3d[] offsets = new Vec3d[] {
+                mid.add(side.multiply(2.8)).add(dir.multiply(-0.8)),
+                mid.add(side.multiply(3.2)).add(dir.multiply(0.9)),
+                mid.add(side.multiply(-2.8)).add(dir.multiply(-0.8)),
+                mid.add(side.multiply(-3.2)).add(dir.multiply(0.9))
+        };
+
+        List<String> names = new ArrayList<>(SPECTATOR_NAMES);
+        Collections.shuffle(names);
+
+        for (int i = 0; i < offsets.length; i++) {
+            Vec3d spot = offsets[i];
+            BlockPos topPos = world.getTopPosition(Heightmap.Type.MOTION_BLOCKING_NO_LEAVES, BlockPos.ofFloored(spot.x, mid.y, spot.z));
+            double spawnY = Math.abs(topPos.getY() - mid.y) <= 3.0 ? topPos.getY() : mid.y;
+
+            VillagerEntity spectator = new VillagerEntity(EntityType.VILLAGER, world);
+            spectator.refreshPositionAndAngles(spot.x, spawnY, spot.z, 0, 0);
+            spectator.setAiDisabled(true);
+            spectator.setInvulnerable(true);
+            spectator.setSilent(true);
+            spectator.setCustomName(Text.literal(names.get(i % names.size())));
+            spectator.setCustomNameVisible(true);
+            spectator.lookAt(EntityAnchorArgumentType.EntityAnchor.EYES, mid.add(0, 1.2, 0));
+
+            if (world.spawnEntity(spectator)) {
+                session.spectatorIds.add(spectator.getUuid());
+                world.spawnParticles(ParticleTypes.POOF, spot.x, spawnY + 0.8, spot.z, 10, 0.3, 0.4, 0.3, 0.02);
+            }
+        }
+    }
+
+    private void despawnSpectators(ServerWorld world, ShowdownSession session) {
+        for (UUID specId : session.spectatorIds) {
+            Entity spec = world.getEntity(specId);
+            if (spec != null) {
+                world.spawnParticles(ParticleTypes.POOF, spec.getX(), spec.getY() + 0.8, spec.getZ(), 8, 0.25, 0.4, 0.25, 0.02);
+                spec.discard();
+            }
+        }
+        session.spectatorIds.clear();
     }
 
     private void finishShowdown(MinecraftServer server, ShowdownSession session, GeminiJudgeClient.JudgeVerdict verdict) {
@@ -364,6 +464,8 @@ public class BazarMod implements ModInitializer {
         if (player == null) return;
 
         ServerWorld world = player.getServerWorld();
+        despawnSpectators(world, session);
+
         LivingEntity mob = (world.getEntity(session.targetMobId) instanceof LivingEntity le && le.isAlive()) ? le : null;
 
         if (mob != null) {
@@ -411,7 +513,7 @@ public class BazarMod implements ModInitializer {
         }
 
         if (progUpdate.newlyDominated()) {
-            player.sendMessage(Text.literal("🔥 ДОМИНАЦИЯ! Все мобы типа [" + session.mobName + "] теперь боятся тебя и будут убегать без боя!")
+            player.sendMessage(Text.literal("🔥 ДОМИНАЦИЯ! Все мобы типа [" + session.mobName + "] теперь боятся тебя и будут съёбывать без боя!")
                     .formatted(Formatting.LIGHT_PURPLE, Formatting.BOLD), false);
         }
 
@@ -452,5 +554,10 @@ public class BazarMod implements ModInitializer {
     private boolean isMobInShowdown(UUID mobId) {
         return ACTIVE_SHOWDOWNS.values().stream()
                 .anyMatch(s -> s.targetMobId.equals(mobId));
+    }
+
+    private boolean isSpectatorEntity(UUID entityId) {
+        return ACTIVE_SHOWDOWNS.values().stream()
+                .anyMatch(s -> s.spectatorIds.contains(entityId));
     }
 }

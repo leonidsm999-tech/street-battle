@@ -28,7 +28,9 @@ public class BazarModClient implements ClientModInitializer {
 
     private enum BattlePhase {
         NONE,
-        UNIFIED_BATTLE, // Combines Mob's full diss AND Player's prompter/mic in one unified window!
+        VS_INTRO,      // Split-screen VS splash like screenshot 1
+        MOB_ROUND,     // Mob's round: lines reveal progressively one by one + speech bubble
+        PLAYER_ROUND,  // Player's round: bottom grid with mob's lines + peach prompter words + mic bar
         EVALUATING,
         VERDICT
     }
@@ -37,19 +39,19 @@ public class BazarModClient implements ClientModInitializer {
     private static UUID activeShowdownId = null;
     private static int activeMobEntityId = -1;
     private static String currentMobName = "";
+    private static String currentMobNickname = "";
+    private static String currentTierBadge = "ДВОРОВЫЙ";
     private static List<String> currentMobDissLines = List.of();
     private static List<String> currentWords = List.of();
     private static int playerTurnDurationSec = 15;
 
-    // Progression info shown in battle HUD
     private static int mobCurWins = 0;
     private static int mobReqWins = 3;
     private static String playerRank = "Новичок на районе";
     private static int playerXp = 0;
 
-    private static long battleStartMs = 0L;
-    private static long recordingStartMs = 0L;
-    private static long battleEndMs = 0L;
+    private static long phaseStartMs = 0L;
+    private static long phaseEndMs = 0L;
     private static boolean micRecordingStarted = false;
 
     // Friend invite state
@@ -61,7 +63,10 @@ public class BazarModClient implements ClientModInitializer {
     private static BazarNetworking.ShowdownResultPayload lastVerdict = null;
 
     public static boolean isBattleHudActive() {
-        return phase == BattlePhase.UNIFIED_BATTLE || phase == BattlePhase.EVALUATING;
+        return phase == BattlePhase.VS_INTRO
+                || phase == BattlePhase.MOB_ROUND
+                || phase == BattlePhase.PLAYER_ROUND
+                || phase == BattlePhase.EVALUATING;
     }
 
     @Override
@@ -107,19 +112,28 @@ public class BazarModClient implements ClientModInitializer {
                 }
             }
 
-            // After 3.0s read-in, trigger microphone recording while keeping the exact same unified HUD!
-            if (phase == BattlePhase.UNIFIED_BATTLE && !micRecordingStarted && System.currentTimeMillis() >= recordingStartMs) {
-                beginMicRecording(client);
+            long now = System.currentTimeMillis();
+
+            // Transition 1: VS_INTRO -> MOB_ROUND
+            if (phase == BattlePhase.VS_INTRO && now >= phaseEndMs) {
+                startMobRoundPhase();
+            }
+
+            // Transition 2: MOB_ROUND -> PLAYER_ROUND
+            if (phase == BattlePhase.MOB_ROUND && now >= phaseEndMs && !micRecordingStarted) {
+                startPlayerRoundPhase(client);
             }
         });
 
-        // Start showdown -> Launch Unified Battle HUD immediately
+        // Start showdown -> Launch Split-Screen VS_INTRO first!
         ClientPlayNetworking.registerGlobalReceiver(BazarNetworking.StartShowdownPayload.ID, (payload, context) -> {
             MinecraftClient client = context.client();
             client.execute(() -> {
                 activeShowdownId = payload.showdownId();
                 activeMobEntityId = payload.mobEntityId();
                 currentMobName = payload.mobName();
+                currentMobNickname = payload.mobStreetNickname();
+                currentTierBadge = payload.tierBadge();
                 currentMobDissLines = payload.mobDissLines().isEmpty()
                         ? List.of("Поясни за свой базар, фраер!")
                         : payload.mobDissLines();
@@ -136,10 +150,9 @@ public class BazarModClient implements ClientModInitializer {
                 startBattleMusic(client);
 
                 long now = System.currentTimeMillis();
-                battleStartMs = now;
-                recordingStartMs = now + 3000L; // 3 seconds to read the mob's diss before mic starts recording
-                battleEndMs = recordingStartMs + (playerTurnDurationSec * 1000L);
-                phase = BattlePhase.UNIFIED_BATTLE;
+                phase = BattlePhase.VS_INTRO;
+                phaseStartMs = now;
+                phaseEndMs = now + 2600L; // 2.6s dramatic VS splash screen
             });
         });
 
@@ -152,7 +165,7 @@ public class BazarModClient implements ClientModInitializer {
             });
         });
 
-        // Verdict received -> Save to History & show detailed post-battle breakdown card
+        // Verdict received -> Save to History & show post-battle breakdown card
         ClientPlayNetworking.registerGlobalReceiver(BazarNetworking.ShowdownResultPayload.ID, (payload, context) -> {
             MinecraftClient client = context.client();
             client.execute(() -> {
@@ -163,9 +176,8 @@ public class BazarModClient implements ClientModInitializer {
                 mobCurWins = payload.mobWinsAfter();
                 mobReqWins = payload.mobWinsRequired();
 
-                // Save record to persistent battle history
                 BattleHistoryManager.BattleRecord rec = new BattleHistoryManager.BattleRecord();
-                rec.mobName = currentMobName;
+                rec.mobName = currentMobNickname + " (" + currentMobName + ")";
                 rec.mobDissLines = new ArrayList<>(currentMobDissLines);
                 rec.promptWords = new ArrayList<>(payload.promptWords());
                 rec.usedWords = new ArrayList<>(payload.usedWords());
@@ -180,8 +192,8 @@ public class BazarModClient implements ClientModInitializer {
                 BattleHistoryManager.addRecord(rec);
 
                 phase = BattlePhase.VERDICT;
-                battleStartMs = System.currentTimeMillis();
-                battleEndMs = battleStartMs + 11000L; // 11 seconds to read the breakdown
+                phaseStartMs = System.currentTimeMillis();
+                phaseEndMs = phaseStartMs + 11000L;
             });
         });
 
@@ -203,19 +215,32 @@ public class BazarModClient implements ClientModInitializer {
             });
         });
 
-        // Render Unified Battle HUD
-        HudRenderCallback.EVENT.register((drawContext, tickCounter) -> renderUnifiedBattleHud(drawContext));
+        HudRenderCallback.EVENT.register((drawContext, tickCounter) -> renderBattleHud(drawContext));
     }
 
-    private static void beginMicRecording(MinecraftClient client) {
+    private static void startMobRoundPhase() {
+        long now = System.currentTimeMillis();
+        // Give generous time for the mob's round (~2.7s per line, minimum 7.5s) so lines reveal progressively!
+        long mobRoundMs = Math.max(7500L, currentMobDissLines.size() * 2700L);
+        phase = BattlePhase.MOB_ROUND;
+        phaseStartMs = now;
+        phaseEndMs = now + mobRoundMs;
+    }
+
+    private static void startPlayerRoundPhase(MinecraftClient client) {
         micRecordingStarted = true;
+        long now = System.currentTimeMillis();
+        phase = BattlePhase.PLAYER_ROUND;
+        phaseStartMs = now;
+        phaseEndMs = now + (playerTurnDurationSec * 1000L);
+
         UUID sessionId = activeShowdownId;
         MicrophoneRecorder.recordAsync(playerTurnDurationSec, wavBytes -> {
             client.execute(() -> {
-                if (phase == BattlePhase.UNIFIED_BATTLE) {
+                if (phase == BattlePhase.PLAYER_ROUND) {
                     phase = BattlePhase.EVALUATING;
-                    battleStartMs = System.currentTimeMillis();
-                    battleEndMs = battleStartMs + 18000L;
+                    phaseStartMs = System.currentTimeMillis();
+                    phaseEndMs = phaseStartMs + 18000L;
                 }
                 stopBattleMusic(client);
                 if (sessionId != null) {
@@ -239,7 +264,7 @@ public class BazarModClient implements ClientModInitializer {
         }
     }
 
-    private static void renderUnifiedBattleHud(DrawContext ctx) {
+    private static void renderBattleHud(DrawContext ctx) {
         MinecraftClient client = MinecraftClient.getInstance();
         if (client.player == null) return;
         TextRenderer tr = client.textRenderer;
@@ -249,127 +274,243 @@ public class BazarModClient implements ClientModInitializer {
         int centerY = screenH / 2;
         long now = System.currentTimeMillis();
 
-        if (phase != BattlePhase.NONE && now > battleEndMs && !(phase == BattlePhase.UNIFIED_BATTLE && !micRecordingStarted)) {
+        if (phase != BattlePhase.NONE && now > phaseEndMs && phase != BattlePhase.VS_INTRO && phase != BattlePhase.MOB_ROUND) {
             phase = BattlePhase.NONE;
         }
 
-        // --- 1. UNIFIED BATTLE WINDOW (Mob's Diss + Player's Words & Mic together!) ---
-        if (phase == BattlePhase.UNIFIED_BATTLE) {
-            int boxW = Math.min(screenW - 20, 440);
-            int boxH = 186;
-            int x1 = centerX - boxW / 2;
-            int y1 = centerY - boxH / 2;
+        // =========================================================================
+        // 1. VS INTRO SCREEN (Full-screen Navy Blue vs Crimson Split like screenshot 1!)
+        // =========================================================================
+        if (phase == BattlePhase.VS_INTRO) {
+            // Left half: Deep Navy Blue; Right half: Deep Crimson Red
+            ctx.fill(0, 0, centerX, screenH, 0xF00B1938);
+            ctx.fill(centerX, 0, screenW, screenH, 0xF03B0B0B);
 
-            boolean isRecording = micRecordingStarted;
-            int borderColor = isRecording ? 0xFF00E5FF : 0xFFFFAA00;
-            int headerBg = isRecording ? 0xBB0C2E3E : 0xBB3A220C;
+            // Center vertical neon divider (Cyan left edge, Orange-Red right edge)
+            ctx.fill(centerX - 2, 0, centerX, screenH, 0xFF29B6F6);
+            ctx.fill(centerX, 0, centerX + 2, screenH, 0xFFFF5722);
 
-            ctx.fill(x1, y1, x1 + boxW, y1 + boxH, 0xE2101118);
-            ctx.drawBorder(x1, y1, boxW, boxH, borderColor);
-            ctx.fill(x1 + 1, y1 + 1, x1 + boxW - 1, y1 + 22, headerBg);
+            // --- LEFT SIDE: PLAYER ---
+            int leftCenterX = screenW / 4;
+            int boxSize = 56;
+            int pBoxX = leftCenterX - boxSize / 2;
+            int pBoxY = centerY - 38;
 
-            // Header with Timer & Rank/Mastery
-            String statusText;
-            if (!isRecording) {
-                double prepLeft = Math.max(0.0, (recordingStartMs - now) / 1000.0);
-                statusText = String.format(Locale.US, "🔥 СТРЕЛКА С %s  |  ЧИТАЙ ПРЕДЪЯВУ (%.1fс)",
-                        currentMobName.toUpperCase(Locale.ROOT), prepLeft);
-            } else {
-                double talkLeft = Math.max(0.0, (battleEndMs - now) / 1000.0);
-                statusText = String.format(Locale.US, "🎤 ТВОЙ ОТВЕТ! ПЕРЕБАЗАРЬ %s  |  ⏱ %.1fс",
-                        currentMobName.toUpperCase(Locale.ROOT), talkLeft);
-            }
-            ctx.drawCenteredTextWithShadow(tr, Text.literal(statusText), centerX, y1 + 7, isRecording ? 0xFF55FFFF : 0xFFFFD700);
+            ctx.fill(pBoxX, pBoxY, pBoxX + boxSize, pBoxY + boxSize, 0xFF152A55);
+            ctx.drawBorder(pBoxX - 2, pBoxY - 2, boxSize + 4, boxSize + 4, 0xFF29B6F6);
+            renderEntityPortrait(ctx, pBoxX, pBoxY, pBoxX + boxSize, pBoxY + boxSize, client.player, true);
 
-            // Left Column: 3D Mob Avatar + Mastery Progress
-            int avatarW = 72;
-            int avatarH = 92;
-            int avX1 = x1 + 8;
-            int avY1 = y1 + 27;
-            ctx.fill(avX1, avY1, avX1 + avatarW, avY1 + avatarH, 0x66000000);
-            ctx.drawBorder(avX1, avY1, avatarW, avatarH, 0x77FF6666);
-            renderMobAvatar(client, ctx, avX1, avY1, avX1 + avatarW, avY1 + avatarH - 14);
+            String playerName = client.player.getName().getString();
+            ctx.drawCenteredTextWithShadow(tr, Text.literal(playerName), leftCenterX, pBoxY + boxSize + 8, 0xFF4FC3F7);
+            ctx.drawCenteredTextWithShadow(tr, Text.literal("(" + playerRank + ")"), leftCenterX, pBoxY + boxSize + 20, 0xFFBBBBCC);
 
-            String masteryStr = "Побед: " + mobCurWins + "/" + mobReqWins;
-            ctx.drawCenteredTextWithShadow(tr, Text.literal(masteryStr), avX1 + avatarW / 2, avY1 + avatarH - 11, 0xFFFFAA00);
-
-            // Top-Right Box: FULL MOB DISS (always visible so player can respond to every line!)
-            int dissX = avX1 + avatarW + 8;
-            int dissW = boxW - avatarW - 24;
-            ctx.fill(dissX, avY1, dissX + dissW, avY1 + avatarH, 0x55221218);
-            ctx.drawBorder(dissX, avY1, dissW, avatarH, 0x55FF5555);
-
-            ctx.drawTextWithShadow(tr, Text.literal("💬 " + currentMobName + " говорит:"), dissX + 6, avY1 + 5, 0xFFFF7777);
-
-            int curY = avY1 + 17;
-            for (String line : currentMobDissLines) {
-                List<OrderedText> wrapped = tr.wrapLines(Text.literal("• " + line), dissW - 12);
-                for (OrderedText ot : wrapped) {
-                    if (curY + 9 < avY1 + avatarH - 3) {
-                        ctx.drawTextWithShadow(tr, ot, dissX + 6, curY, 0xFFFFE082);
-                        curY += 10;
-                    }
+            // --- RIGHT SIDE: MOB ---
+            int rightCenterX = (screenW * 3) / 4;
+            int mBoxY = centerY - 46;
+            if (client.world != null && activeMobEntityId >= 0) {
+                Entity ent = client.world.getEntityById(activeMobEntityId);
+                if (ent instanceof LivingEntity living) {
+                    renderEntityPortrait(ctx, rightCenterX - 40, mBoxY, rightCenterX + 40, mBoxY + 66, living, false);
                 }
-                curY += 2;
             }
 
-            // Divider line between Mob's Round and Player's Round
-            int divY = avY1 + avatarH + 5;
-            ctx.fill(x1 + 8, divY, x1 + boxW - 8, divY + 1, 0x558888AA);
-
-            // Bottom Section: Player's Prompter Words + Live Mic Bar
-            int playerY = divY + 5;
+            int textStartY = centerY + 24;
+            ctx.drawCenteredTextWithShadow(tr, Text.literal(currentMobNickname), rightCenterX, textStartY, 0xFFFF9800);
             ctx.drawCenteredTextWithShadow(tr,
-                    Text.literal("ВПЛЕТИ В СВОЙ ОТВЕТ СЛОВА (Ранг: " + playerRank + "):"),
-                    centerX, playerY, 0xFFBBBBCC);
+                    Text.literal("(" + currentMobName + " " + Math.min(mobCurWins + 1, mobReqWins) + "/" + mobReqWins + ")"),
+                    rightCenterX, textStartY + 12, 0xFFFFFFFF);
 
-            String wordsLine = "[ " + String.join(" ]  [ ", currentWords).toUpperCase(Locale.ROOT) + " ]";
-            List<OrderedText> wordsWrapped = tr.wrapLines(Text.literal(wordsLine), boxW - 20);
-            int wY = playerY + 12;
-            for (int i = 0; i < Math.min(2, wordsWrapped.size()); i++) {
-                ctx.drawCenteredTextWithShadow(tr, wordsWrapped.get(i), centerX, wY, 0xFF55FF55);
-                wY += 11;
+            // Orange Tier Badge Pill (like "МЕЛОЧЬ" in screenshot 1)
+            int badgeW = tr.getWidth(currentTierBadge) + 14;
+            int badgeX = rightCenterX - badgeW / 2;
+            int badgeY = textStartY + 25;
+            ctx.fill(badgeX, badgeY, badgeX + badgeW, badgeY + 13, 0xFFE67E22);
+            ctx.drawBorder(badgeX, badgeY, badgeW, 13, 0xFF000000);
+            ctx.drawCenteredTextWithShadow(tr, Text.literal(currentTierBadge), rightCenterX, badgeY + 3, 0xFFFFFFFF);
+
+            // --- CENTER: BIG BOLD "VS" + 4 ANIMATED DOTS ---
+            ctx.getMatrices().push();
+            ctx.getMatrices().scale(3.0f, 3.0f, 1.0f);
+            int scaledCenterX = (int) (centerX / 3.0f);
+            int scaledCenterY = (int) ((centerY - 16) / 3.0f);
+            ctx.drawCenteredTextWithShadow(tr, Text.literal("VS"), scaledCenterX, scaledCenterY, 0xFFFFD54F);
+            ctx.getMatrices().pop();
+
+            // 4 progress squares under VS
+            double introProgress = Math.min(1.0, (double) (now - phaseStartMs) / Math.max(1L, phaseEndMs - phaseStartMs));
+            int activeDot = Math.min(3, (int) (introProgress * 4));
+            int dotSize = 6;
+            int dotGap = 5;
+            int totalDotsW = 4 * dotSize + 3 * dotGap;
+            int dotsStartX = centerX - totalDotsW / 2;
+            int dotsY = centerY + 18;
+            for (int d = 0; d < 4; d++) {
+                int dx = dotsStartX + d * (dotSize + dotGap);
+                int color = (d == activeDot) ? 0xFFFFD54F : 0xFF424242;
+                ctx.fill(dx, dotsY, dx + dotSize, dotsY + dotSize, color);
+                ctx.drawBorder(dx, dotsY, dotSize, dotSize, 0xFF111111);
             }
-
-            // Live Microphone Level Bar
-            float level = isRecording ? MicrophoneRecorder.getCurrentLevel() : 0.0f;
-            int barW = boxW - 28;
-            int barH = 9;
-            int barX = centerX - barW / 2;
-            int barY = y1 + boxH - 23;
-            ctx.fill(barX, barY, barX + barW, barY + barH, 0xFF20202A);
-            int filledW = (int) (barW * level);
-            int barColor = level > 0.65f ? 0xFFFF5555 : (level > 0.15f ? 0xFF55FF55 : 0xFF5599FF);
-            ctx.fill(barX, barY, barX + filledW, barY + barH, barColor);
-            ctx.drawBorder(barX, barY, barW, barH, 0xFF666677);
-
-            String micHint;
-            if (!isRecording) {
-                micHint = "⏳ Приготовься! Запись начнётся через секунду...";
-            } else if (level > 0.08f) {
-                micHint = "🎙 Микрофон пишет! Дави напором и отвечай на предъяву!";
-            } else {
-                micHint = "🎙 Говори в микрофон громче и увереннее!";
-            }
-            ctx.drawCenteredTextWithShadow(tr, Text.literal(micHint), centerX, y1 + boxH - 12, 0xFFDDDDDD);
             return;
         }
 
-        // --- 2. EVALUATING ---
+        // =========================================================================
+        // 2 & 3. IN-GAME BATTLE HUD (Like Screenshot 2: Top VS Bar + Countdown + Speech Bubble + Bottom Grid)
+        // =========================================================================
+        if (phase == BattlePhase.MOB_ROUND || phase == BattlePhase.PLAYER_ROUND) {
+            boolean isMobTurn = (phase == BattlePhase.MOB_ROUND);
+
+            // --- TOP COMPACT VS HEADER & BIG COUNTDOWN NUMBER ---
+            String pName = client.player.getName().getString();
+            String topTitle = "§b" + pName + "  §fVS  §6" + currentMobNickname + "  §7[" + currentTierBadge + "]";
+            int topW = tr.getWidth(Text.literal(pName + "  VS  " + currentMobNickname + "  [" + currentTierBadge + "]")) + 24;
+            ctx.fill(centerX - topW / 2, 4, centerX + topW / 2, 18, 0xCC101016);
+            ctx.drawCenteredTextWithShadow(tr, Text.literal(topTitle), centerX, 7, 0xFFFFFFFF);
+
+            // Big countdown digit right below top bar (like "2" in screenshot 2)
+            double remSec = Math.max(0.0, (phaseEndMs - now) / 1000.0);
+            int secInt = (int) Math.ceil(remSec);
+            ctx.getMatrices().push();
+            ctx.getMatrices().scale(2.0f, 2.0f, 1.0f);
+            ctx.drawCenteredTextWithShadow(tr, Text.literal(String.valueOf(secInt)),
+                    (int) (centerX / 2.0f), 11, isMobTurn ? 0xFFFF7043 : 0xFFFFD54F);
+            ctx.getMatrices().pop();
+
+            // How many mob lines have appeared so far (progressive reveal during MOB_ROUND, all visible in PLAYER_ROUND)
+            int visibleLineCount;
+            if (isMobTurn) {
+                double mobProg = Math.min(0.999, (double) (now - phaseStartMs) / Math.max(1L, phaseEndMs - phaseStartMs));
+                visibleLineCount = Math.min(currentMobDissLines.size(), 1 + (int) (mobProg * currentMobDissLines.size()));
+            } else {
+                visibleLineCount = currentMobDissLines.size();
+            }
+
+            // --- FLOATING SPEECH BUBBLE NEXT TO MOB (like "МС Бе-Бе" bubble in screenshot 2!) ---
+            String latestMobLine = currentMobDissLines.get(Math.max(0, visibleLineCount - 1));
+            renderMobSpeechBubble(ctx, tr, screenW, screenH, latestMobLine);
+
+            // --- BOTTOM PROMPTER & DISS GRID PANEL (Styled after screenshot 2) ---
+            int panelW = Math.min(screenW - 24, 440);
+            int panelH = 104;
+            int px1 = centerX - panelW / 2;
+            int py1 = screenH - panelH - 12;
+
+            // Top-left orange-bordered tab on the bottom box (like "перевод с овечьего" in screenshot 2)
+            String tabLabel = isMobTurn
+                    ? "раунд моба: " + currentMobNickname.toLowerCase(Locale.ROOT)
+                    : "твой выход: вплети слова справа";
+            int tabW = tr.getWidth(tabLabel) + 14;
+            ctx.fill(px1, py1 - 14, px1 + tabW, py1, 0xEE181820);
+            ctx.drawBorder(px1, py1 - 14, tabW, 15, 0xFFE67E22);
+            ctx.drawTextWithShadow(tr, Text.literal(tabLabel), px1 + 7, py1 - 11, 0xFFFFCC80);
+
+            // Main bottom container
+            ctx.fill(px1, py1, px1 + panelW, py1 + panelH, 0xE612131A);
+            ctx.drawBorder(px1, py1, panelW, panelH, isMobTurn ? 0xFFE67E22 : 0xFF29B6F6);
+
+            // Split bottom container into:
+            // Left 68% (3 columns x 3 rows): Mob's progressively revealed diss chunks
+            // Right 32% (1 column of peach/orange cells): Required prompter words!
+            int leftAreaW = (int) (panelW * 0.68);
+            int rightAreaW = panelW - leftAreaW - 8;
+            int leftStartX = px1 + 5;
+            int rightStartX = px1 + leftAreaW + 4;
+            int gridTopY = py1 + 5;
+            int gridH = panelH - 24; // leave 19px at bottom for mic bar / status
+
+            // Render 3x3 dark cells for Mob's diss lines (progressive reveal!)
+            int cols = 3;
+            int rows = 3;
+            int cellW = (leftAreaW - 8) / cols;
+            int cellH = (gridH - 4) / rows;
+
+            for (int r = 0; r < rows; r++) {
+                boolean lineRevealed = r < visibleLineCount;
+                String[] chunks = lineRevealed ? splitIntoThreeChunks(currentMobDissLines.get(r)) : new String[]{"•", "•", "•"};
+                boolean isCurrentLine = isMobTurn && (r == visibleLineCount - 1);
+
+                for (int c = 0; c < cols; c++) {
+                    int cx = leftStartX + c * cellW;
+                    int cy = gridTopY + r * cellH;
+                    int cellBg = isCurrentLine ? 0xFF262230 : 0xFF1A1B24;
+                    ctx.fill(cx + 1, cy + 1, cx + cellW - 1, cy + cellH - 1, cellBg);
+                    ctx.drawBorder(cx + 1, cy + 1, cellW - 2, cellH - 2, isCurrentLine ? 0x88FF9800 : 0xFF282A36);
+
+                    String cellText = chunks[c];
+                    int txtColor = !lineRevealed ? 0xFF555566 : (isCurrentLine ? 0xFFFFD54F : 0xFFDDDDDD);
+                    // Fit text inside cell
+                    while (tr.getWidth(cellText) > cellW - 6 && cellText.length() > 3) {
+                        cellText = cellText.substring(0, cellText.length() - 2) + "…";
+                    }
+                    ctx.drawCenteredTextWithShadow(tr, Text.literal(cellText), cx + cellW / 2, cy + (cellH - 8) / 2, txtColor);
+                }
+            }
+
+            // Render Right Column: Peach/Orange Prompter Word Cells (like "белая / я / бе-е-е / везде" in screenshot 2!)
+            int wordSlots = Math.max(1, currentWords.size());
+            int wCellH = Math.max(12, (gridH - 2) / wordSlots);
+            for (int w = 0; w < wordSlots; w++) {
+                int wy = gridTopY + w * wCellH;
+                int actualH = (w == wordSlots - 1) ? (gridTopY + gridH - wy) : (wCellH - 1);
+                // Peach-orange highlight when it's player's turn, muted when mob is still talking
+                int pillColor = isMobTurn ? 0xFF5C4033 : (w == wordSlots - 1 ? 0xFFE57373 : 0xFFF4A261);
+                int textColor = isMobTurn ? 0xFFCCCCCC : 0xFF111111;
+
+                ctx.fill(rightStartX, wy, rightStartX + rightAreaW, wy + actualH, pillColor);
+                ctx.drawBorder(rightStartX, wy, rightAreaW, actualH, 0xFF1A1A22);
+
+                String wordUpper = currentWords.get(w).toUpperCase(Locale.ROOT);
+                if (isMobTurn) {
+                    ctx.drawCenteredTextWithShadow(tr, Text.literal(wordUpper), rightStartX + rightAreaW / 2, wy + (actualH - 8) / 2, textColor);
+                } else {
+                    // Dark crisp text on bright peach cell without muddy shadow
+                    int tw = tr.getWidth(wordUpper);
+                    ctx.drawText(tr, wordUpper, rightStartX + (rightAreaW - tw) / 2, wy + (actualH - 8) / 2, textColor, false);
+                }
+            }
+
+            // Bottom status & live microphone bar inside the panel
+            int barY = py1 + panelH - 15;
+            int barW = panelW - 12;
+            int barX = px1 + 6;
+            ctx.fill(barX, barY, barX + barW, barY + 10, 0xFF1E1E28);
+
+            if (isMobTurn) {
+                double mobProg = Math.min(1.0, (double) (now - phaseStartMs) / Math.max(1L, phaseEndMs - phaseStartMs));
+                ctx.fill(barX, barY, barX + (int) (barW * mobProg), barY + 10, 0xFFE67E22);
+                ctx.drawCenteredTextWithShadow(tr,
+                        Text.literal("👂 Слушай наезд моба (" + visibleLineCount + "/" + currentMobDissLines.size() + ") и готовь ответку..."),
+                        centerX, barY + 1, 0xFFFFFFFF);
+            } else {
+                float level = MicrophoneRecorder.getCurrentLevel();
+                int barColor = level > 0.65f ? 0xFFFF5555 : (level > 0.15f ? 0xFF55FF55 : 0xFF29B6F6);
+                ctx.fill(barX, barY, barX + (int) (barW * level), barY + 10, barColor);
+                String micLabel = level > 0.08f
+                        ? "🎙 МИКРОФОН ПИШЕТ! ДАВИ НАПОРОМ И ВПЛЕТАЙ СЛОВА!"
+                        : "🎙 ГОВОРИ В МИКРОФОН ГРОМЧЕ! (Ранг: " + playerRank + ")";
+                ctx.drawCenteredTextWithShadow(tr, Text.literal(micLabel), centerX, barY + 1, 0xFFFFFFFF);
+            }
+            return;
+        }
+
+        // =========================================================================
+        // 4. EVALUATING
+        // =========================================================================
         if (phase == BattlePhase.EVALUATING) {
             int boxW = Math.min(screenW - 24, 340);
             int boxH = 54;
             int x1 = centerX - boxW / 2;
             int y1 = centerY - boxH / 2;
 
-            ctx.fill(x1, y1, x1 + boxW, y1 + boxH, 0xE2141218);
+            ctx.fill(x1, y1, x1 + boxW, y1 + boxH, 0xE6141218);
             ctx.drawBorder(x1, y1, boxW, boxH, 0xFFFFAA00);
             ctx.drawCenteredTextWithShadow(tr, Text.literal("⏳ СМОТРЯЩИЙ ДЕЛАЕТ РАЗБОР БАТТЛА..."), centerX, y1 + 14, 0xFFFFD700);
-            ctx.drawCenteredTextWithShadow(tr, Text.literal("Нейросеть оценивает панчи, подачу и слова суфлера"), centerX, y1 + 30, 0xFFBBBBBB);
+            ctx.drawCenteredTextWithShadow(tr, Text.literal("Нейросеть оценивает панчи, напор и слова суфлера"), centerX, y1 + 30, 0xFFBBBBBB);
             return;
         }
 
-        // --- 3. POST-BATTLE BREAKDOWN CARD ---
+        // =========================================================================
+        // 5. POST-BATTLE BREAKDOWN CARD
+        // =========================================================================
         if (phase == BattlePhase.VERDICT && lastVerdict != null) {
             int boxW = Math.min(screenW - 20, 440);
             int boxH = 166;
@@ -377,7 +518,7 @@ public class BazarModClient implements ClientModInitializer {
             int y1 = centerY - boxH / 2;
             int borderColor = lastVerdict.win() ? 0xFF55FF55 : 0xFFFF5555;
 
-            ctx.fill(x1, y1, x1 + boxW, y1 + boxH, 0xE4101016);
+            ctx.fill(x1, y1, x1 + boxW, y1 + boxH, 0xE8101016);
             ctx.drawBorder(x1, y1, boxW, boxH, borderColor);
 
             String header = (lastVerdict.win() ? "✅ ПОБЕДА В БАЗАРЕ" : "❌ ТЕБЯ ПЕРЕБАЗАРИЛИ")
@@ -389,7 +530,6 @@ public class BazarModClient implements ClientModInitializer {
                     + (lastVerdict.newlyDominated() ? " §d(БОИТСЯ ТЕБЯ!)" : "");
             ctx.drawCenteredTextWithShadow(tr, Text.literal(progLine), centerX, y1 + 20, 0xFF55FFFF);
 
-            // Used vs Missed words
             Set<String> usedLower = new HashSet<>();
             for (String w : lastVerdict.usedWords()) {
                 usedLower.add(w.toLowerCase(Locale.ROOT).trim());
@@ -402,7 +542,6 @@ public class BazarModClient implements ClientModInitializer {
             ctx.drawCenteredTextWithShadow(tr, Text.literal(wordStatus.toString().trim()), centerX, y1 + 34, 0xFFFFFFFF);
 
             int curY = y1 + 49;
-            // Best punch / key moment
             List<OrderedText> punchLines = tr.wrapLines(Text.literal("🎯 Ключевой момент: " + lastVerdict.bestPunch()), boxW - 22);
             for (int i = 0; i < Math.min(2, punchLines.size()); i++) {
                 ctx.drawCenteredTextWithShadow(tr, punchLines.get(i), centerX, curY, 0xFF88FF88);
@@ -410,7 +549,6 @@ public class BazarModClient implements ClientModInitializer {
             }
             curY += 2;
 
-            // Judge breakdown
             List<OrderedText> judgeLines = tr.wrapLines(Text.literal("⚖ Разбор Смотрящего: " + lastVerdict.judgeComment()), boxW - 22);
             for (int i = 0; i < Math.min(3, judgeLines.size()); i++) {
                 ctx.drawCenteredTextWithShadow(tr, judgeLines.get(i), centerX, curY, 0xFFFFFFFF);
@@ -418,8 +556,7 @@ public class BazarModClient implements ClientModInitializer {
             }
             curY += 2;
 
-            // Mob final reaction
-            List<OrderedText> mobLines = tr.wrapLines(Text.literal(currentMobName + ": «" + lastVerdict.mobReaction() + "»"), boxW - 22);
+            List<OrderedText> mobLines = tr.wrapLines(Text.literal(currentMobNickname + ": «" + lastVerdict.mobReaction() + "»"), boxW - 22);
             for (int i = 0; i < Math.min(2, mobLines.size()); i++) {
                 ctx.drawCenteredTextWithShadow(tr, mobLines.get(i), centerX, curY, 0xFFFFD700);
                 curY += 11;
@@ -431,7 +568,9 @@ public class BazarModClient implements ClientModInitializer {
             return;
         }
 
-        // --- 4. FRIEND INVITE BANNER ---
+        // =========================================================================
+        // 6. FRIEND INVITE BANNER
+        // =========================================================================
         if (pendingInviteId != null && now < inviteExpireMs) {
             int boxW = Math.min(screenW - 20, 380);
             int x1 = centerX - boxW / 2;
@@ -441,16 +580,58 @@ public class BazarModClient implements ClientModInitializer {
         }
     }
 
-    private static void renderMobAvatar(MinecraftClient client, DrawContext ctx, int x1, int y1, int x2, int y2) {
-        if (client.world == null || activeMobEntityId < 0) return;
-        Entity entity = client.world.getEntityById(activeMobEntityId);
-        if (entity instanceof LivingEntity living) {
-            try {
-                float height = Math.max(0.6f, living.getHeight());
-                int scale = (int) Math.max(14, Math.min(34, 48.0f / height));
-                InventoryScreen.drawEntity(ctx, x1, y1, x2, y2, scale, 0.0625f, (x1 + x2) / 2.0f - 15.0f, (y1 + y2) / 2.0f, living);
-            } catch (Throwable ignored) {
-            }
+    private static void renderMobSpeechBubble(DrawContext ctx, TextRenderer tr, int screenW, int screenH, String line) {
+        int bubbleW = Math.min(185, screenW / 3);
+        List<OrderedText> wrapped = tr.wrapLines(Text.literal(line), bubbleW - 14);
+        int bubbleH = 18 + wrapped.size() * 10;
+
+        // Place speech bubble to the right of center (next to the mob facing you!)
+        int bx = Math.min(screenW - bubbleW - 10, (screenW / 2) + 46);
+        int by = Math.max(36, (screenH / 2) - 42);
+
+        // Cream/white speech bubble with dark border (matching screenshot 2!)
+        ctx.fill(bx, by, bx + bubbleW, by + bubbleH, 0xF5F6F2E8);
+        ctx.drawBorder(bx, by, bubbleW, bubbleH, 0xFF222222);
+
+        // Little pointer triangle on the left side pointing toward the mob
+        ctx.fill(bx - 4, by + 10, bx, by + 16, 0xF5F6F2E8);
+        ctx.fill(bx - 7, by + 12, bx - 4, by + 15, 0xF5F6F2E8);
+
+        // Mob nickname in orange at top of bubble
+        ctx.drawCenteredTextWithShadow(tr, Text.literal(currentMobNickname), bx + bubbleW / 2, by + 4, 0xFFE65100);
+
+        int ty = by + 15;
+        for (OrderedText ot : wrapped) {
+            int lw = tr.getWidth(ot);
+            ctx.drawText(tr, ot, bx + (bubbleW - lw) / 2, ty, 0xFF1A1A1A, false);
+            ty += 10;
+        }
+    }
+
+    private static String[] splitIntoThreeChunks(String sentence) {
+        String[] words = sentence.trim().split("\\s+");
+        if (words.length <= 1) {
+            return new String[]{sentence, "", ""};
+        }
+        if (words.length == 2) {
+            return new String[]{words[0], words[1], ""};
+        }
+        int p1 = Math.max(1, words.length / 3);
+        int p2 = Math.max(p1 + 1, (words.length * 2) / 3);
+        String c1 = String.join(" ", Arrays.copyOfRange(words, 0, p1));
+        String c2 = String.join(" ", Arrays.copyOfRange(words, p1, p2));
+        String c3 = String.join(" ", Arrays.copyOfRange(words, p2, words.length));
+        return new String[]{c1, c2, c3};
+    }
+
+    private static void renderEntityPortrait(DrawContext ctx, int x1, int y1, int x2, int y2, LivingEntity entity, boolean isPlayer) {
+        try {
+            float height = Math.max(0.6f, entity.getHeight());
+            int scale = isPlayer ? 26 : (int) Math.max(18, Math.min(36, 52.0f / height));
+            float lookX = isPlayer ? (x1 + x2) / 2.0f + 18.0f : (x1 + x2) / 2.0f - 18.0f;
+            float lookY = (y1 + y2) / 2.0f - 6.0f;
+            InventoryScreen.drawEntity(ctx, x1, y1, x2, y2, scale, 0.0625f, lookX, lookY, entity);
+        } catch (Throwable ignored) {
         }
     }
 }
