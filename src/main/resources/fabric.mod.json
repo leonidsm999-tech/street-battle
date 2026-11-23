@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "bazarmod",
+  "version": "${version}",
+  "name": "Bazar Battle (Дворовая Стрелка)",
+  "description": "Перебазарь мобов в микрофон по понятиям под легендарный саундтрек, пока нейросеть-Смотрящий оценивает твой авторитет.",
+  "authors": [
+    "BazarDev"
+  ],
+  "license": "MIT",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "com.bazarmod.BazarMod"
+    ],
+    "client": [
+      "com.bazarmod.client.BazarModClient"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "~1.21.1",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}

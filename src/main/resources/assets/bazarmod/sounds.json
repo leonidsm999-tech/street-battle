@@ -1,0 +1,11 @@
+{
+  "battle_theme": {
+    "subtitle": "subtitles.bazarmod.battle_theme",
+    "sounds": [
+      {
+        "name": "bazarmod:battle_theme",
+        "stream": true
+      }
+    ]
+  }
+}
