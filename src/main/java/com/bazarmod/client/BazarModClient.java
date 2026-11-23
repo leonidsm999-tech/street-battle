@@ -53,6 +53,12 @@ public class BazarModClient implements ClientModInitializer {
     // Verdict banner state
     private static BazarNetworking.ShowdownResultPayload lastVerdict = null;
 
+    public static boolean isBattleHudActive() {
+        return phase == BattlePhase.MOB_DISS
+                || phase == BattlePhase.PLAYER_TURN
+                || phase == BattlePhase.EVALUATING;
+    }
+
     @Override
     public void onInitializeClient() {
         joinBattleKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
@@ -89,7 +95,7 @@ public class BazarModClient implements ClientModInitializer {
             }
         });
 
-        // Start showdown -> Begin with Phase 1 (MOB_DISS: the mob roasts/battles you!)
+        // Start showdown -> Phase 1 (MOB_DISS: mob roasts player in centered window + battle music)
         ClientPlayNetworking.registerGlobalReceiver(BazarNetworking.StartShowdownPayload.ID, (payload, context) -> {
             MinecraftClient client = context.client();
             client.execute(() -> {
@@ -97,25 +103,19 @@ public class BazarModClient implements ClientModInitializer {
                 activeMobEntityId = payload.mobEntityId();
                 currentMobName = payload.mobName();
                 currentMobDissLines = payload.mobDissLines().isEmpty()
-                        ? List.of("Поясни за свой базар!")
+                        ? List.of("Поясни за свой базар, фраер!")
                         : payload.mobDissLines();
                 currentWords = payload.promptWords();
                 playerTurnDurationSec = payload.durationSec();
                 lastVerdict = null;
                 recordingStartedForCurrentBattle = false;
 
-                stopBattleMusic(client);
-                activeMusic = new BattleMusicSoundInstance();
-                client.getSoundManager().play(activeMusic);
+                startBattleMusic(client);
 
-                // Phase 1 duration scales with number of diss lines (~1.7s per line, min 4.2s)
-                long dissDurationMs = Math.max(4200L, currentMobDissLines.size() * 1750L);
+                long dissDurationMs = Math.max(4500L, currentMobDissLines.size() * 1800L);
                 phase = BattlePhase.MOB_DISS;
                 phaseStartMs = System.currentTimeMillis();
                 phaseEndMs = phaseStartMs + dissDurationMs;
-
-                // Voice the mob's diss aloud via TTS!
-                TtsSpeaker.speakAsync(String.join(". ", currentMobDissLines), true);
             });
         });
 
@@ -128,7 +128,7 @@ public class BazarModClient implements ClientModInitializer {
             });
         });
 
-        // Verdict received -> Show centered verdict card & voice Judge + Mob reaction
+        // Verdict received -> Show centered verdict card
         ClientPlayNetworking.registerGlobalReceiver(BazarNetworking.ShowdownResultPayload.ID, (payload, context) -> {
             MinecraftClient client = context.client();
             client.execute(() -> {
@@ -137,8 +137,6 @@ public class BazarModClient implements ClientModInitializer {
                 phase = BattlePhase.VERDICT;
                 phaseStartMs = System.currentTimeMillis();
                 phaseEndMs = phaseStartMs + 9000L;
-
-                TtsSpeaker.speakAsync(payload.judgeComment() + ". " + payload.mobReaction(), false);
             });
         });
 
@@ -160,7 +158,6 @@ public class BazarModClient implements ClientModInitializer {
 
     private static void startPlayerTurnPhase(MinecraftClient client) {
         recordingStartedForCurrentBattle = true;
-        TtsSpeaker.stopCurrent(); // stop mob TTS so mic doesn't pick it up
 
         phase = BattlePhase.PLAYER_TURN;
         phaseStartMs = System.currentTimeMillis();
@@ -182,8 +179,15 @@ public class BazarModClient implements ClientModInitializer {
         });
     }
 
+    private static void startBattleMusic(MinecraftClient client) {
+        stopBattleMusic(client);
+        activeMusic = new BattleMusicSoundInstance();
+        client.getSoundManager().play(activeMusic);
+    }
+
     private static void stopBattleMusic(MinecraftClient client) {
         if (activeMusic != null) {
+            activeMusic.stopMusic();
             client.getSoundManager().stop(activeMusic);
             activeMusic = null;
         }
@@ -206,26 +210,24 @@ public class BazarModClient implements ClientModInitializer {
         // --- CENTERED DIALOG BOX ---
         if (phase == BattlePhase.MOB_DISS) {
             int boxW = Math.min(screenW - 24, 390);
-            int boxH = 126;
+            int boxH = 128;
             int x1 = centerX - boxW / 2;
             int y1 = centerY - boxH / 2;
 
-            // Backdrop & crimson/gold border
-            ctx.fill(x1, y1, x1 + boxW, y1 + boxH, 0xDD110E16);
+            ctx.fill(x1, y1, x1 + boxW, y1 + boxH, 0xE0110E16);
             ctx.drawBorder(x1, y1, boxW, boxH, 0xFFFF4444);
-            ctx.fill(x1 + 1, y1 + 1, x1 + boxW - 1, y1 + 22, 0xAA3A1018);
+            ctx.fill(x1 + 1, y1 + 1, x1 + boxW - 1, y1 + 22, 0xBB3A1018);
 
             ctx.drawCenteredTextWithShadow(tr,
                     Text.literal("🔥 НАЕЗД МОБА: " + currentMobName.toUpperCase(Locale.ROOT) + " БАТТЛИТ ТЕБЯ!"),
                     centerX, y1 + 7, 0xFFFF6666);
 
-            // Render 3D Mob Avatar on the left side of the centered dialog
+            // 3D Mob Avatar inside the centered dialog box
             int avatarAreaW = 68;
             ctx.fill(x1 + 8, y1 + 28, x1 + 8 + avatarAreaW, y1 + boxH - 10, 0x66000000);
             ctx.drawBorder(x1 + 8, y1 + 28, avatarAreaW, boxH - 38, 0x88FF5555);
             renderMobAvatar(client, ctx, x1 + 8, y1 + 28, x1 + 8 + avatarAreaW, y1 + boxH - 10);
 
-            // Progressive karaoke reveal of the mob's diss lines on the right
             int textLeft = x1 + avatarAreaW + 18;
             int textMaxW = boxW - avatarAreaW - 28;
             double progress = Math.min(1.0, (double) (now - phaseStartMs) / Math.max(1L, phaseEndMs - phaseStartMs));
@@ -247,27 +249,26 @@ public class BazarModClient implements ClientModInitializer {
             }
 
             ctx.drawCenteredTextWithShadow(tr,
-                    Text.literal("Готовь ответ! Скоро включится твой микрофон..."),
+                    Text.literal("Готовь ответку! Скоро врубится твой микрофон..."),
                     centerX + avatarAreaW / 2, y1 + boxH - 13, 0xFF999999);
             return;
         }
 
         if (phase == BattlePhase.PLAYER_TURN) {
             int boxW = Math.min(screenW - 24, 410);
-            int boxH = 136;
+            int boxH = 138;
             int x1 = centerX - boxW / 2;
             int y1 = centerY - boxH / 2;
 
-            ctx.fill(x1, y1, x1 + boxW, y1 + boxH, 0xDD0E151E);
+            ctx.fill(x1, y1, x1 + boxW, y1 + boxH, 0xE00E151E);
             ctx.drawBorder(x1, y1, boxW, boxH, 0xFF00E5FF);
-            ctx.fill(x1 + 1, y1 + 1, x1 + boxW - 1, y1 + 22, 0xAA0C2E3E);
+            ctx.fill(x1 + 1, y1 + 1, x1 + boxW - 1, y1 + 22, 0xBB0C2E3E);
 
             double remaining = Math.max(0.0, (phaseEndMs - now) / 1000.0);
             String title = String.format(Locale.US, "🎤 ТВОЙ ВЫХОД! ПЕРЕБАЗАРЬ %s  |  ⏱ %.1fс",
                     currentMobName.toUpperCase(Locale.ROOT), remaining);
             ctx.drawCenteredTextWithShadow(tr, Text.literal(title), centerX, y1 + 7, 0xFF55FFFF);
 
-            // Last punchline from mob so player remembers what to clap back at
             String lastLine = currentMobDissLines.isEmpty() ? "" : currentMobDissLines.get(currentMobDissLines.size() - 1);
             List<OrderedText> claimWrapped = tr.wrapLines(Text.literal("Моб: «" + lastLine + "»"), boxW - 24);
             int curY = y1 + 28;
@@ -276,7 +277,6 @@ public class BazarModClient implements ClientModInitializer {
                 curY += 11;
             }
 
-            // Prompter trigger words
             ctx.drawCenteredTextWithShadow(tr, Text.literal("ВПЛЕТИ В БАЗАР ЭТИ СЛОВА:"), centerX, y1 + 54, 0xFFAAAAAA);
 
             String wordsLine = "[ " + String.join(" ]   [ ", currentWords).toUpperCase(Locale.ROOT) + " ]";
@@ -312,7 +312,7 @@ public class BazarModClient implements ClientModInitializer {
             int x1 = centerX - boxW / 2;
             int y1 = centerY - boxH / 2;
 
-            ctx.fill(x1, y1, x1 + boxW, y1 + boxH, 0xDD141218);
+            ctx.fill(x1, y1, x1 + boxW, y1 + boxH, 0xE0141218);
             ctx.drawBorder(x1, y1, boxW, boxH, 0xFFFFAA00);
             ctx.drawCenteredTextWithShadow(tr, Text.literal("⏳ СМОТРЯЩИЙ ОЦЕНИВАЕТ ТВОЙ БАЗАР..."), centerX, y1 + 14, 0xFFFFD700);
             ctx.drawCenteredTextWithShadow(tr, Text.literal("Нейросеть проверяет слова и уверенность в голосе"), centerX, y1 + 30, 0xFFBBBBBB);
@@ -326,14 +326,13 @@ public class BazarModClient implements ClientModInitializer {
             int y1 = centerY - boxH / 2;
             int borderColor = lastVerdict.win() ? 0xFF55FF55 : 0xFFFF5555;
 
-            ctx.fill(x1, y1, x1 + boxW, y1 + boxH, 0xDD101016);
+            ctx.fill(x1, y1, x1 + boxW, y1 + boxH, 0xE0101016);
             ctx.drawBorder(x1, y1, boxW, boxH, borderColor);
 
             String header = (lastVerdict.win() ? "✅ АВТОРИТЕТ ПОДТВЕРЖДЁН" : "❌ ТЕБЯ ПЕРЕБАЗАРИЛИ")
                     + "  |  СЧЁТ: " + lastVerdict.score() + "/100";
             ctx.drawCenteredTextWithShadow(tr, Text.literal(header), centerX, y1 + 8, borderColor);
 
-            // Show which words were counted vs missed
             Set<String> usedLower = new HashSet<>();
             for (String w : lastVerdict.usedWords()) {
                 usedLower.add(w.toLowerCase(Locale.ROOT).trim());
@@ -345,7 +344,6 @@ public class BazarModClient implements ClientModInitializer {
             }
             ctx.drawCenteredTextWithShadow(tr, Text.literal(wordStatus.toString().trim()), centerX, y1 + 24, 0xFFFFFFFF);
 
-            // Wrapped Judge Comment
             int curY = y1 + 42;
             List<OrderedText> judgeLines = tr.wrapLines(Text.literal("Смотрящий: " + lastVerdict.judgeComment()), boxW - 24);
             for (int i = 0; i < Math.min(3, judgeLines.size()); i++) {
@@ -353,7 +351,6 @@ public class BazarModClient implements ClientModInitializer {
                 curY += 11;
             }
 
-            // Wrapped Mob Reaction
             curY += 4;
             List<OrderedText> mobLines = tr.wrapLines(Text.literal(currentMobName + ": «" + lastVerdict.mobReaction() + "»"), boxW - 24);
             for (int i = 0; i < Math.min(2, mobLines.size()); i++) {
