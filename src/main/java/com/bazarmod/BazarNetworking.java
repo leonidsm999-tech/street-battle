@@ -220,6 +220,26 @@ public class BazarNetworking {
         }
     }
 
+        // C2S: Client sends typed chat text instead of microphone audio
+    public record SubmitTextPayload(UUID showdownId, String textResponse) implements CustomPayload {
+        public static final Id<SubmitTextPayload> ID = new Id<>(Identifier.of(BazarMod.MOD_ID, "submit_text"));
+        public static final PacketCodec<RegistryByteBuf, SubmitTextPayload> CODEC = PacketCodec.ofStatic(
+                (buf, payload) -> {
+                    buf.writeUuid(payload.showdownId);
+                    buf.writeString(payload.textResponse);
+                },
+                buf -> new SubmitTextPayload(
+                        buf.readUuid(),
+                        buf.readString(1000)
+                )
+        );
+
+        @Override
+        public Id<? extends CustomPayload> getId() {
+            return ID;
+        }
+    }
+
     // C2S: Friend accepts invite to back up player
     public record JoinShowdownPayload(UUID showdownId) implements CustomPayload {
         public static final Id<JoinShowdownPayload> ID = new Id<>(Identifier.of(BazarMod.MOD_ID, "join_showdown"));
@@ -280,6 +300,7 @@ public class BazarNetworking {
         PayloadTypeRegistry.playS2C().register(OpenScreenPayload.ID, OpenScreenPayload.CODEC);
 
         PayloadTypeRegistry.playC2S().register(SubmitAudioPayload.ID, SubmitAudioPayload.CODEC);
+        PayloadTypeRegistry.playC2S().register(SubmitTextPayload.ID, SubmitTextPayload.CODEC);
         PayloadTypeRegistry.playC2S().register(JoinShowdownPayload.ID, JoinShowdownPayload.CODEC);
         PayloadTypeRegistry.playC2S().register(SyncConfigPayload.ID, SyncConfigPayload.CODEC);
     }

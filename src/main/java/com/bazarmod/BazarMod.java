@@ -240,6 +240,43 @@ public class BazarMod implements ModInitializer {
             });
         });
 
+                // Receive typed chat response from client (fallback when mic is unavailable)
+        ServerPlayNetworking.registerGlobalReceiver(BazarNetworking.SubmitTextPayload.ID, (payload, context) -> {
+            ServerPlayerEntity player = context.player();
+            MinecraftServer server = player.getServer();
+            if (server == null) return;
+
+            server.execute(() -> {
+                ShowdownSession session = ACTIVE_SHOWDOWNS.get(payload.showdownId());
+                if (session == null || session.evaluating) return;
+                if (!session.primaryPlayerId.equals(player.getUuid())) return;
+
+                String text = payload.textResponse() == null ? "" : payload.textResponse().trim();
+                if (text.isEmpty()) return;
+
+                session.evaluating = true;
+                ServerPlayNetworking.send(player, new BazarNetworking.StopMusicPayload(true));
+                player.sendMessage(Text.literal("⏳ Смотрящий читает твою маляву из чата...").formatted(Formatting.GOLD), true);
+
+                if (session.helperPlayerId != null) {
+                    ServerPlayerEntity helper = server.getPlayerManager().getPlayer(session.helperPlayerId);
+                    if (helper != null) {
+                        ServerPlayNetworking.send(helper, new BazarNetworking.StopMusicPayload(true));
+                        helper.sendMessage(Text.literal("⏳ Смотрящий выносит вердикт...").formatted(Formatting.GOLD), true);
+                    }
+                }
+
+                String fullDiss = String.join(" ", session.mobDissLines);
+                GeminiJudgeClient.evaluateTextAsync(
+                        session.mobStreetNickname,
+                        fullDiss,
+                        session.promptWords,
+                        session.effectiveWinThreshold,
+                        text
+                ).thenAccept(verdict -> server.execute(() -> finishShowdown(server, session, verdict)));
+            });
+        });
+
         // Friend joins showdown
         ServerPlayNetworking.registerGlobalReceiver(BazarNetworking.JoinShowdownPayload.ID, (payload, context) -> {
             ServerPlayerEntity helper = context.player();

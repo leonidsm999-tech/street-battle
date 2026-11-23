@@ -15,20 +15,30 @@ public class MicrophoneRecorder {
     private static final int CHANNELS = 1;
 
     private static volatile float currentLevel = 0.0f;
+    private static volatile int activeSessionToken = 0;
 
     public static float getCurrentLevel() {
         return currentLevel;
     }
 
-    public static void recordAsync(int durationSec, Consumer<byte[]> onComplete) {
+    public static void cancel() {
+        activeSessionToken++;
         currentLevel = 0.0f;
+    }
+
+    public static void recordAsync(int durationSec, Consumer<byte[]> onComplete) {
+        final int myToken = ++activeSessionToken;
+        currentLevel = 0.0f;
+
         Thread thread = new Thread(() -> {
             AudioFormat format = new AudioFormat(SAMPLE_RATE, SAMPLE_SIZE_BITS, CHANNELS, true, false);
             DataLine.Info info = new DataLine.Info(TargetDataLine.class, format);
 
             if (!AudioSystem.isLineSupported(info)) {
                 BazarMod.LOGGER.warn("Microphone line not supported, sending silent WAV.");
-                onComplete.accept(wrapPcmAsWav(new byte[3200]));
+                if (activeSessionToken == myToken) {
+                    onComplete.accept(wrapPcmAsWav(new byte[3200]));
+                }
                 return;
             }
 
@@ -41,6 +51,11 @@ public class MicrophoneRecorder {
                 long endTime = System.currentTimeMillis() + (durationSec * 1000L);
 
                 while (System.currentTimeMillis() < endTime) {
+                    if (activeSessionToken != myToken) {
+                        line.stop();
+                        currentLevel = 0.0f;
+                        return;
+                    }
                     int read = line.read(chunk, 0, chunk.length);
                     if (read > 0) {
                         pcmBuffer.write(chunk, 0, read);
@@ -50,12 +65,16 @@ public class MicrophoneRecorder {
 
                 line.stop();
                 currentLevel = 0.0f;
-                byte[] wavBytes = wrapPcmAsWav(pcmBuffer.toByteArray());
-                onComplete.accept(wavBytes);
+                if (activeSessionToken == myToken) {
+                    byte[] wavBytes = wrapPcmAsWav(pcmBuffer.toByteArray());
+                    onComplete.accept(wavBytes);
+                }
             } catch (Exception e) {
                 BazarMod.LOGGER.error("Microphone recording failed", e);
                 currentLevel = 0.0f;
-                onComplete.accept(wrapPcmAsWav(new byte[3200]));
+                if (activeSessionToken == myToken) {
+                    onComplete.accept(wrapPcmAsWav(new byte[3200]));
+                }
             }
         }, "BazarMod-MicRecorder");
 
@@ -72,7 +91,6 @@ public class MicrophoneRecorder {
         }
         if (samples == 0) return 0.0f;
         double rms = Math.sqrt((double) sumSq / samples);
-        // Normalize typical speech RMS (~4000-12000) to 0.0..1.0
         return (float) Math.min(1.0, rms / 9000.0);
     }
 

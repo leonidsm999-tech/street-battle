@@ -4,6 +4,7 @@ import com.bazarmod.BazarNetworking;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+import net.fabricmc.fabric.api.client.message.v1.ClientSendMessageEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
 import net.minecraft.client.MinecraftClient;
@@ -129,6 +130,25 @@ public class BazarModClient implements ClientModInitializer {
             }
         });
 
+                // Intercept chat messages during battle so players without a mic can type their diss in chat!
+        ClientSendMessageEvents.ALLOW_CHAT.register(message -> {
+            if ((phase == BattlePhase.MOB_ROUND || phase == BattlePhase.PLAYER_ROUND) && activeShowdownId != null) {
+                String trimmed = message == null ? "" : message.trim();
+                if (!trimmed.isEmpty()) {
+                    MicrophoneRecorder.cancel();
+                    micRecordingStarted = true;
+                    phase = BattlePhase.EVALUATING;
+                    phaseStartMs = System.currentTimeMillis();
+                    phaseEndMs = phaseStartMs + 18000L;
+                    MinecraftClient mc = MinecraftClient.getInstance();
+                    stopBattleMusic(mc);
+                    ClientPlayNetworking.send(new BazarNetworking.SubmitTextPayload(activeShowdownId, trimmed));
+                    return false; // consume chat message so it doesn't spam public chat
+                }
+            }
+            return true;
+        });
+
         // Start showdown -> Launch Animated VS_INTRO
         ClientPlayNetworking.registerGlobalReceiver(BazarNetworking.StartShowdownPayload.ID, (payload, context) -> {
             MinecraftClient client = context.client();
@@ -175,6 +195,7 @@ public class BazarModClient implements ClientModInitializer {
         ClientPlayNetworking.registerGlobalReceiver(BazarNetworking.ShowdownResultPayload.ID, (payload, context) -> {
             MinecraftClient client = context.client();
             client.execute(() -> {
+                MicrophoneRecorder.cancel();
                 stopBattleMusic(client);
                 lastVerdict = payload;
                 playerRank = payload.rankTitle();
@@ -348,8 +369,11 @@ public class BazarModClient implements ClientModInitializer {
 
             int textStartY = centerY + 24;
             ctx.drawCenteredTextWithShadow(tr, Text.literal(currentMobNickname), rightCenterX, textStartY, (alphaSolid << 24) | 0xFF9800);
+            String vsCountLabel = currentMobNickname.equalsIgnoreCase(currentMobName)
+                    ? "(" + Math.min(mobCurWins + 1, mobReqWins) + "/" + mobReqWins + ")"
+                    : "(" + currentMobName + " " + Math.min(mobCurWins + 1, mobReqWins) + "/" + mobReqWins + ")";
             ctx.drawCenteredTextWithShadow(tr,
-                    Text.literal("(" + currentMobName + " " + Math.min(mobCurWins + 1, mobReqWins) + "/" + mobReqWins + ")"),
+                    Text.literal(vsCountLabel),
                     rightCenterX, textStartY + 12, (alphaSolid << 24) | 0xFFFFFF);
 
             int badgeW = tr.getWidth(currentTierBadge) + 14;
@@ -455,7 +479,7 @@ public class BazarModClient implements ClientModInitializer {
 
                 String micPrompt = level > 0.08f
                         ? "🎙 МИКРОФОН ПИШЕТ — ДАВИ НАПОРОМ!"
-                        : "🎙 ГОВОРИ В МИКРОФОН И ВПЛЕТАЙ СЛОВА ВЫШЕ";
+                        : "🎙 ГОВОРИ В МИКРОФОН ИЛИ ПИШИ В ЧАТ [T]";
                 ctx.drawCenteredTextWithShadow(tr, Text.literal(micPrompt), centerX, screenH - 12, 0xFFDDDDDD);
             }
             return;

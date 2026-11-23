@@ -167,7 +167,7 @@ public class BazarDictionary {
 
         String nickname = entity.hasCustomName() && entity.getCustomName() != null
                 ? entity.getCustomName().getString()
-                : MOB_NICKNAMES.getOrDefault(pathKey, "МС " + entity.getName().getString());
+                : MOB_NICKNAMES.getOrDefault(pathKey, entity.getName().getString());
 
         String tierBadge = TIER_BADGES.getOrDefault(tier, "ДВОРОВЫЙ");
 

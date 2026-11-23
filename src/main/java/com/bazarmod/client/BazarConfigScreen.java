@@ -2,6 +2,7 @@ package com.bazarmod.client;
 
 import com.bazarmod.BazarConfig;
 import com.bazarmod.BazarNetworking;
+import com.bazarmod.GeminiJudgeClient;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.minecraft.client.gui.DrawContext;
 import net.minecraft.client.gui.screen.Screen;
@@ -20,9 +21,13 @@ public class BazarConfigScreen extends Screen {
     private TextFieldWidget proxyPortField;
     private TextFieldWidget durationField;
     private TextFieldWidget minScoreField;
+    private ButtonWidget testApiButton;
 
     private boolean maskApiKey = true;
     private boolean mockMode;
+    private boolean testingApi = false;
+    private String apiTestStatus = "";
+    private int apiTestStatusColor = 0xFFCCCCCC;
 
     public BazarConfigScreen(Screen parent) {
         super(Text.literal("Настройки Дворовой Стрелки (Bazar Battle)"));
@@ -37,11 +42,11 @@ public class BazarConfigScreen extends Screen {
         int centerX = this.width / 2;
         int fieldW = 240;
         int leftX = centerX - fieldW / 2;
-        int y = 38;
-        int rowStep = 35;
+        int y = 32;
+        int rowStep = 31;
 
         // 1. API Key + Eye toggle button
-        this.apiKeyField = new TextFieldWidget(this.textRenderer, leftX, y, fieldW - 26, 18, Text.literal("API Ключ Gemini"));
+        this.apiKeyField = new TextFieldWidget(this.textRenderer, leftX, y, fieldW - 26, 17, Text.literal("API Ключ Gemini"));
         this.apiKeyField.setMaxLength(256);
         this.apiKeyField.setText(cfg.apiKey);
         this.apiKeyField.setPlaceholder(Text.literal("AIzaSy... (ключ Google AI Studio)"));
@@ -54,25 +59,25 @@ public class BazarConfigScreen extends Screen {
         this.addDrawableChild(this.apiKeyField);
 
         this.addDrawableChild(ButtonWidget.builder(Text.literal("👁"), btn -> maskApiKey = !maskApiKey)
-                .dimensions(leftX + fieldW - 22, y - 1, 22, 20)
+                .dimensions(leftX + fieldW - 22, y - 1, 22, 19)
                 .build());
         y += rowStep;
 
         // 2. Gemini Model
-        this.modelField = new TextFieldWidget(this.textRenderer, leftX, y, fieldW, 18, Text.literal("Модель Gemini"));
+        this.modelField = new TextFieldWidget(this.textRenderer, leftX, y, fieldW, 17, Text.literal("Модель Gemini"));
         this.modelField.setMaxLength(100);
         this.modelField.setText(cfg.model);
         this.addDrawableChild(this.modelField);
         y += rowStep;
 
         // 3. Proxy Host & Port
-        this.proxyHostField = new TextFieldWidget(this.textRenderer, leftX, y, 165, 18, Text.literal("Прокси Хост"));
+        this.proxyHostField = new TextFieldWidget(this.textRenderer, leftX, y, 165, 17, Text.literal("Прокси Хост"));
         this.proxyHostField.setMaxLength(120);
         this.proxyHostField.setText(cfg.proxyHost);
         this.proxyHostField.setPlaceholder(Text.literal("127.0.0.1 (пусто = без прокси)"));
         this.addDrawableChild(this.proxyHostField);
 
-        this.proxyPortField = new TextFieldWidget(this.textRenderer, leftX + 172, y, fieldW - 172, 18, Text.literal("Порт"));
+        this.proxyPortField = new TextFieldWidget(this.textRenderer, leftX + 172, y, fieldW - 172, 17, Text.literal("Порт"));
         this.proxyPortField.setMaxLength(6);
         this.proxyPortField.setText(cfg.proxyPort > 0 ? String.valueOf(cfg.proxyPort) : "");
         this.proxyPortField.setPlaceholder(Text.literal("Порт"));
@@ -80,12 +85,12 @@ public class BazarConfigScreen extends Screen {
         y += rowStep;
 
         // 4. Duration (sec) & Min Score & Mock Mode
-        this.durationField = new TextFieldWidget(this.textRenderer, leftX, y, 68, 18, Text.literal("Секунды"));
+        this.durationField = new TextFieldWidget(this.textRenderer, leftX, y, 68, 17, Text.literal("Секунды"));
         this.durationField.setMaxLength(3);
         this.durationField.setText(String.valueOf(cfg.battleDurationSec));
         this.addDrawableChild(this.durationField);
 
-        this.minScoreField = new TextFieldWidget(this.textRenderer, leftX + 74, y, 68, 18, Text.literal("Порог"));
+        this.minScoreField = new TextFieldWidget(this.textRenderer, leftX + 74, y, 68, 17, Text.literal("Порог"));
         this.minScoreField.setMaxLength(3);
         this.minScoreField.setText(String.valueOf(cfg.minWinScore));
         this.addDrawableChild(this.minScoreField);
@@ -93,25 +98,58 @@ public class BazarConfigScreen extends Screen {
         this.addDrawableChild(ButtonWidget.builder(getMockLabel(), btn -> {
             mockMode = !mockMode;
             btn.setMessage(getMockLabel());
-        }).dimensions(leftX + 148, y - 1, fieldW - 148, 20).build());
-        y += rowStep + 4;
+        }).dimensions(leftX + 148, y - 1, fieldW - 148, 19).build());
+        y += rowStep + 2;
 
-        // Save & Cancel
-        this.addDrawableChild(ButtonWidget.builder(Text.literal("✅ Сохранить и применить"), btn -> saveAndClose())
-                .dimensions(leftX, y, 152, 22)
+        // 5. Test API Connection + Save & Cancel
+        this.testApiButton = ButtonWidget.builder(Text.literal("🔌 Тест API"), btn -> runApiTest())
+                .dimensions(leftX, y, 76, 20)
+                .build();
+        this.addDrawableChild(this.testApiButton);
+
+        this.addDrawableChild(ButtonWidget.builder(Text.literal("✅ Сохранить"), btn -> saveAndClose())
+                .dimensions(leftX + 80, y, 102, 20)
                 .build());
 
         this.addDrawableChild(ButtonWidget.builder(Text.literal("Отмена"), btn -> close())
-                .dimensions(leftX + 158, y, fieldW - 158, 22)
+                .dimensions(leftX + 186, y, fieldW - 186, 20)
                 .build());
-        y += 28;
+        y += 24;
 
-        // Open Battle History & Breakdowns button
+        // 6. Open Battle History & Breakdowns button
         this.addDrawableChild(ButtonWidget.builder(Text.literal("📜 История баттлов и разборы [H]"), btn -> {
             if (this.client != null) {
                 this.client.setScreen(new BazarHistoryScreen(this));
             }
-        }).dimensions(leftX, y, fieldW, 20).build());
+        }).dimensions(leftX, y, fieldW, 19).build());
+    }
+
+    private void runApiTest() {
+        if (testingApi) return;
+        testingApi = true;
+        apiTestStatus = "⏳ Проверяем связь с Gemini...";
+        apiTestStatusColor = 0xFFFFD54F;
+        if (this.testApiButton != null) {
+            this.testApiButton.active = false;
+        }
+
+        String key = this.apiKeyField.getText().trim();
+        String mdl = this.modelField.getText().trim();
+        String host = this.proxyHostField.getText().trim();
+        int port = parseSafeInt(this.proxyPortField.getText(), 0, 0, 65535);
+
+        GeminiJudgeClient.testConnectionAsync(key, mdl, host, port).thenAccept(res -> {
+            if (this.client != null) {
+                this.client.execute(() -> {
+                    testingApi = false;
+                    apiTestStatus = res.message();
+                    apiTestStatusColor = res.ok() ? 0xFF55FF55 : 0xFFFF5555;
+                    if (this.testApiButton != null) {
+                        this.testApiButton.active = true;
+                    }
+                });
+            }
+        });
     }
 
     private Text getMockLabel() {
@@ -158,10 +196,10 @@ public class BazarConfigScreen extends Screen {
 
         int centerX = this.width / 2;
         int leftX = centerX - 120;
-        int y = 27;
-        int rowStep = 35;
+        int y = 22;
+        int rowStep = 31;
 
-        context.drawCenteredTextWithShadow(this.textRenderer, this.title, centerX, 10, 0xFFFFAA00);
+        context.drawCenteredTextWithShadow(this.textRenderer, this.title, centerX, 8, 0xFFFFAA00);
 
         context.drawTextWithShadow(this.textRenderer, Text.literal("API Ключ Gemini (Google AI Studio):"), leftX, y, 0xFFCCCCCC);
         y += rowStep;
@@ -173,6 +211,11 @@ public class BazarConfigScreen extends Screen {
         y += rowStep;
 
         context.drawTextWithShadow(this.textRenderer, Text.literal("Сек. баттла  |  Порог  |  Режим без ключа:"), leftX, y, 0xFFCCCCCC);
+
+        if (!apiTestStatus.isEmpty()) {
+            int statusY = 32 + rowStep * 4 + 48;
+            context.drawCenteredTextWithShadow(this.textRenderer, Text.literal(apiTestStatus), centerX, statusY, apiTestStatusColor);
+        }
     }
 
     @Override
