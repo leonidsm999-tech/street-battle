@@ -1,12 +1,15 @@
 package com.bazarmod;
 
 import com.mojang.brigadier.CommandDispatcher;
+import com.mojang.brigadier.arguments.StringArgumentType;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.event.player.AttackEntityCallback;
+import net.fabricmc.fabric.api.event.player.UseBlockCallback;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
+import net.minecraft.block.ChestBlock;
 import net.minecraft.command.argument.EntityAnchorArgumentType;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityType;
@@ -36,6 +39,7 @@ import net.minecraft.util.ActionResult;
 import net.minecraft.util.Formatting;
 import net.minecraft.util.Hand;
 import net.minecraft.util.Identifier;
+import net.minecraft.util.math.BlockBox;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Vec3d;
@@ -57,7 +61,6 @@ public class BazarMod implements ModInitializer {
     private static final Map<UUID, ShowdownSession> ACTIVE_SHOWDOWNS = new ConcurrentHashMap<>();
     private static final Map<UUID, Long> IMMUNE_UNTIL_TICK = new ConcurrentHashMap<>();
 
-    // Track original daylight cycle rule so we can cleanly freeze and restore time
     private static Boolean savedDaylightCycleRule = null;
 
     private static final List<String> SPECTATOR_NAMES = List.of(
@@ -76,6 +79,7 @@ public class BazarMod implements ModInitializer {
         public final UUID targetMobId;
         public final int targetEntityId;
         public final String mobTypeKey;
+        public final String bossTag;
         public final int tier;
         public final String mobName;
         public final String mobStreetNickname;
@@ -85,7 +89,6 @@ public class BazarMod implements ModInitializer {
         public final int effectiveWinThreshold;
         public final long createdTick;
         public final List<UUID> spectatorIds = new ArrayList<>();
-        // Map of frozen bystander mob UUID -> original aiDisabled state
         public final Map<UUID, Boolean> frozenBystanders = new ConcurrentHashMap<>();
         public boolean targetOriginalAiDisabled = false;
         public boolean evaluating = false;
@@ -95,6 +98,7 @@ public class BazarMod implements ModInitializer {
             this.targetMobId = target.getUuid();
             this.targetEntityId = target.getId();
             this.mobTypeKey = bundle.mobTypeKey();
+            this.bossTag = bundle.bossTag();
             this.tier = bundle.tier();
             this.mobName = target.getName().getString();
             this.mobStreetNickname = bundle.mobStreetNickname();
@@ -116,6 +120,29 @@ public class BazarMod implements ModInitializer {
         BazarDictionary.ensureLoaded();
         BazarProgressionManager.ensureLoaded();
         BazarNetworking.registerPayloads();
+        BazarStructures.register();
+
+        // Guard structure chests while the local Spot Boss is still undefeated!
+        UseBlockCallback.EVENT.register((player, world, hand, hitResult) -> {
+            if (world.isClient || hand != Hand.MAIN_HAND) {
+                return ActionResult.PASS;
+            }
+            BlockPos pos = hitResult.getBlockPos();
+            if (world.getBlockState(pos).getBlock() instanceof ChestBlock) {
+                Box guardBox = new Box(pos).expand(9.0);
+                List<LivingEntity> guardians = world.getEntitiesByClass(LivingEntity.class, guardBox,
+                        e -> e.isAlive() && BazarDictionary.getSpotBossTag(e) != null);
+                if (!guardians.isEmpty()) {
+                    LivingEntity boss = guardians.get(0);
+                    player.sendMessage(Text.literal("🚫 ")
+                            .formatted(Formatting.RED)
+                            .append(boss.getName().copy().formatted(Formatting.GOLD, Formatting.BOLD))
+                            .append(Text.literal(": «Куда руки тянешь, фраер?! Сначала базар вывези, потом в общак лезь!»").formatted(Formatting.YELLOW)), true);
+                    return ActionResult.FAIL;
+                }
+            }
+            return ActionResult.PASS;
+        });
 
         // Full damage immunity for players and combatants during an active showdown!
         ServerLivingEntityEvents.ALLOW_DAMAGE.register((entity, source, amount) -> {
@@ -154,23 +181,25 @@ public class BazarMod implements ModInitializer {
                 return ActionResult.FAIL;
             }
 
-            // Check progression domination
-            int tier = BazarDictionary.resolveTier(target);
-            String mobKey = Registries.ENTITY_TYPE.getId(target.getType()).getPath();
-            if (BazarProgressionManager.isMobTypeDominated(serverPlayer.getUuid(), mobKey, tier)) {
-                IMMUNE_UNTIL_TICK.put(target.getUuid(), now + 200L);
-                serverPlayer.sendMessage(Text.literal("😱 " + target.getName().getString() + " в ужасе от твоего авторитета и откупается без базара!")
-                        .formatted(Formatting.AQUA), true);
-                if (world instanceof ServerWorld sw) {
-                    sw.spawnParticles(ParticleTypes.SMOKE, target.getX(), target.getY() + 1.0, target.getZ(), 15, 0.4, 0.4, 0.4, 0.05);
-                    if (new Random().nextFloat() < 0.35f) {
-                        sw.spawnEntity(new ItemEntity(sw, target.getX(), target.getY() + 0.5, target.getZ(), new ItemStack(Items.EMERALD, 1)));
+            // Spot bosses NEVER flee from domination — you always have to battle them!
+            if (BazarDictionary.getSpotBossTag(target) == null) {
+                int tier = BazarDictionary.resolveTier(target);
+                String mobKey = Registries.ENTITY_TYPE.getId(target.getType()).getPath();
+                if (BazarProgressionManager.isMobTypeDominated(serverPlayer.getUuid(), mobKey, tier)) {
+                    IMMUNE_UNTIL_TICK.put(target.getUuid(), now + 200L);
+                    serverPlayer.sendMessage(Text.literal("😱 " + target.getName().getString() + " в ужасе от твоего авторитета и откупается без базара!")
+                            .formatted(Formatting.AQUA), true);
+                    if (world instanceof ServerWorld sw) {
+                        sw.spawnParticles(ParticleTypes.SMOKE, target.getX(), target.getY() + 1.0, target.getZ(), 15, 0.4, 0.4, 0.4, 0.05);
+                        if (new Random().nextFloat() < 0.35f) {
+                            sw.spawnEntity(new ItemEntity(sw, target.getX(), target.getY() + 0.5, target.getZ(), new ItemStack(Items.EMERALD, 1)));
+                        }
                     }
+                    Vec3d flee = target.getPos().subtract(serverPlayer.getPos()).normalize().multiply(1.3);
+                    target.addVelocity(flee.x, 0.35, flee.z);
+                    target.velocityModified = true;
+                    return ActionResult.PASS;
                 }
-                Vec3d flee = target.getPos().subtract(serverPlayer.getPos()).normalize().multiply(1.3);
-                target.addVelocity(flee.x, 0.35, flee.z);
-                target.velocityModified = true;
-                return ActionResult.PASS;
             }
 
             startShowdown(serverPlayer, target);
@@ -296,7 +325,6 @@ public class BazarMod implements ModInitializer {
                 ServerWorld world = player.getServerWorld();
                 Vec3d midPoint = player.getEyePos();
 
-                // Freeze target mob completely
                 if (world.getEntity(session.targetMobId) instanceof LivingEntity mob && mob.isAlive()) {
                     if (mob instanceof MobEntity mobEnt) {
                         mobEnt.setAiDisabled(true);
@@ -309,7 +337,6 @@ public class BazarMod implements ModInitializer {
                     midPoint = player.getEyePos().add(mob.getEyePos()).multiply(0.5);
                 }
 
-                // Freeze any nearby mobs within 40 blocks so nobody interferes or hits the player!
                 Box freezeBox = player.getBoundingBox().expand(40.0);
                 List<MobEntity> nearbyMobs = world.getEntitiesByClass(MobEntity.class, freezeBox,
                         m -> m.isAlive() && !m.getUuid().equals(session.targetMobId) && !session.spectatorIds.contains(m.getUuid()));
@@ -320,7 +347,6 @@ public class BazarMod implements ModInitializer {
                     bystander.setVelocity(Vec3d.ZERO);
                 }
 
-                // Keep spectators watching the showdown
                 for (UUID specId : session.spectatorIds) {
                     Entity spec = world.getEntity(specId);
                     if (spec instanceof LivingEntity livingSpec && livingSpec.isAlive()) {
@@ -331,7 +357,7 @@ public class BazarMod implements ModInitializer {
             }
         });
 
-        // Commands: /bazar test, /bazar config, /bazar history, /bazar rank, /bazar reload
+        // Commands: /bazar test, /bazar spot <padik|kiosk|garage>, /bazar config, /bazar history, /bazar rank, /bazar reload
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> registerCommands(dispatcher));
     }
 
@@ -374,6 +400,45 @@ public class BazarMod implements ModInitializer {
                     startShowdown(player, target);
                     return 1;
                 }))
+                .then(CommandManager.literal("spot")
+                        .then(CommandManager.argument("type", StringArgumentType.word())
+                                .suggests((ctx, builder) -> {
+                                    builder.suggest("padik");
+                                    builder.suggest("kiosk");
+                                    builder.suggest("garage");
+                                    return builder.buildFuture();
+                                })
+                                .executes(ctx -> {
+                                    ServerPlayerEntity player = ctx.getSource().getPlayerOrThrow();
+                                    String rawType = StringArgumentType.getString(ctx, "type").toLowerCase(Locale.ROOT);
+                                    String kind = switch (rawType) {
+                                        case "padik" -> BazarStructures.SPOT_PADIK;
+                                        case "kiosk", "beer_kiosk" -> BazarStructures.SPOT_KIOSK;
+                                        case "garage" -> BazarStructures.SPOT_GARAGE;
+                                        default -> null;
+                                    };
+                                    if (kind == null) {
+                                        player.sendMessage(Text.literal("❌ Укажи тип постройки: padik, kiosk или garage").formatted(Formatting.RED), false);
+                                        return 0;
+                                    }
+                                    ServerWorld world = player.getServerWorld();
+                                    Vec3d look = player.getRotationVec(1.0f);
+                                    BlockPos origin = BlockPos.ofFloored(
+                                            player.getX() + look.x * 6.0,
+                                            player.getY(),
+                                            player.getZ() + look.z * 6.0
+                                    );
+                                    BlockBox bounds = new BlockBox(
+                                            origin.getX() - 8, origin.getY() - 8, origin.getZ() - 8,
+                                            origin.getX() + 8, origin.getY() + 10, origin.getZ() + 8
+                                    );
+                                    BazarStructures.buildSpotAt(world, bounds, origin, kind, world.getRandom());
+                                    player.sendMessage(Text.literal("🏗 Постройка [" + kind + "] заспавнена рядом! Подойди к хозяину точки и ударь его для стрелки.")
+                                            .formatted(Formatting.GREEN), false);
+                                    return 1;
+                                })
+                        )
+                )
                 .then(CommandManager.literal("config").executes(ctx -> {
                     ServerPlayerEntity player = ctx.getSource().getPlayerOrThrow();
                     ServerPlayNetworking.send(player, new BazarNetworking.OpenScreenPayload("config"));
@@ -407,17 +472,18 @@ public class BazarMod implements ModInitializer {
         ServerWorld world = player.getServerWorld();
         MinecraftServer server = world.getServer();
 
-        String mobKey = Registries.ENTITY_TYPE.getId(target.getType()).getPath();
+        String bossTag = BazarDictionary.getSpotBossTag(target);
+        String mobKey = bossTag != null ? bossTag : Registries.ENTITY_TYPE.getId(target.getType()).getPath();
         int curWins = BazarProgressionManager.getMobWins(player.getUuid(), mobKey);
         BazarDictionary.PromptBundle bundle = BazarDictionary.generateFor(target, curWins);
-        int reqWins = BazarProgressionManager.getRequiredWinsForTier(bundle.tier());
+        int reqWins = bossTag != null ? 1 : BazarProgressionManager.getRequiredWinsForTier(bundle.tier());
 
-        int effectiveThreshold = Math.min(85, cfg.minWinScore + (curWins * 5));
+        int baseThreshold = bossTag != null ? Math.max(cfg.minWinScore, 60) : cfg.minWinScore;
+        int effectiveThreshold = Math.min(85, baseThreshold + (curWins * 5));
 
         ShowdownSession session = new ShowdownSession(player.getUuid(), target, bundle, effectiveThreshold, world.getTime());
         ACTIVE_SHOWDOWNS.put(session.id, session);
 
-        // Freeze world time!
         freezeWorldTime(server);
 
         int freezeTicks = (cfg.battleDurationSec + 20) * 20;
@@ -430,7 +496,6 @@ public class BazarMod implements ModInitializer {
         target.addStatusEffect(new StatusEffectInstance(StatusEffects.RESISTANCE, freezeTicks, 255, false, false));
         world.spawnParticles(ParticleTypes.CAMPFIRE_COSY_SMOKE, target.getX(), target.getY() + 1.0, target.getZ(), 30, 0.8, 0.5, 0.8, 0.02);
 
-        // Spawn 4 "Смотрящие" (spectators) on both sides of the arena!
         spawnSpectatorsAroundArena(world, player, target, session);
 
         BazarProgressionManager.PlayerProgress prog = BazarProgressionManager.get(player.getUuid());
@@ -451,7 +516,6 @@ public class BazarMod implements ModInitializer {
                 prog.respectXp
         ));
 
-        // Invite nearby friend within 12 blocks
         List<ServerPlayerEntity> friends = world.getPlayers(p -> p != player && p.squaredDistanceTo(player) <= 144.0);
         for (ServerPlayerEntity friend : friends) {
             if (!isPlayerInShowdown(friend.getUuid())) {
@@ -507,7 +571,6 @@ public class BazarMod implements ModInitializer {
     }
 
     private void cleanupSessionEntities(ServerWorld world, ShowdownSession session) {
-        // Despawn spectators
         for (UUID specId : session.spectatorIds) {
             Entity spec = world.getEntity(specId);
             if (spec != null) {
@@ -517,7 +580,6 @@ public class BazarMod implements ModInitializer {
         }
         session.spectatorIds.clear();
 
-        // Unfreeze all bystander mobs
         for (Map.Entry<UUID, Boolean> entry : session.frozenBystanders.entrySet()) {
             Entity ent = world.getEntity(entry.getKey());
             if (ent instanceof MobEntity mob && mob.isAlive()) {
@@ -526,7 +588,6 @@ public class BazarMod implements ModInitializer {
         }
         session.frozenBystanders.clear();
 
-        // Unfreeze target mob
         if (world.getEntity(session.targetMobId) instanceof LivingEntity mob && mob.isAlive()) {
             if (mob instanceof MobEntity mobEnt) {
                 mobEnt.setAiDisabled(session.targetOriginalAiDisabled);
@@ -589,7 +650,7 @@ public class BazarMod implements ModInitializer {
             world.playSound(null, player.getBlockPos(), SoundEvents.ENTITY_PLAYER_LEVELUP, SoundCategory.PLAYERS, 1.0f, 1.0f);
         }
 
-        if (progUpdate.newlyDominated()) {
+        if (progUpdate.newlyDominated() && session.bossTag == null) {
             player.sendMessage(Text.literal("🔥 ДОМИНАЦИЯ! Все мобы типа [" + session.mobName + "] теперь боятся тебя и будут съёбывать без боя!")
                     .formatted(Formatting.LIGHT_PURPLE, Formatting.BOLD), false);
         }
@@ -605,8 +666,22 @@ public class BazarMod implements ModInitializer {
 
             if (mob != null) {
                 world.spawnParticles(ParticleTypes.TOTEM_OF_UNDYING, mob.getX(), mob.getY() + 1.0, mob.getZ(), 40, 0.5, 0.8, 0.5, 0.2);
-                int emeraldBonus = (rankLvl >= 3 ? 2 : 1) + new Random().nextInt(2);
+                int emeraldBonus = (session.bossTag != null ? 5 : (rankLvl >= 3 ? 2 : 1)) + new Random().nextInt(3);
                 world.spawnEntity(new ItemEntity(world, mob.getX(), mob.getY() + 0.5, mob.getZ(), new ItemStack(Items.EMERALD, emeraldBonus)));
+
+                // Drop Psychedelicraft Vodka, Beer, Cigarettes & Joints!
+                if (session.bossTag != null) {
+                    player.sendMessage(Text.literal("🔓 ТОЧКА ЗАХВАЧЕНА! Общак в сундуке открыт, а с хозяина выпали ништяки!")
+                            .formatted(Formatting.GREEN, Formatting.BOLD), false);
+                    for (ItemStack drop : PsychedelicraftIntegration.generateSpotBossLoot(session.bossTag)) {
+                        world.spawnEntity(new ItemEntity(world, mob.getX(), mob.getY() + 0.5, mob.getZ(), drop));
+                    }
+                } else if (new Random().nextFloat() < 0.45f) {
+                    for (ItemStack drop : PsychedelicraftIntegration.generateSpotBossLoot(null)) {
+                        world.spawnEntity(new ItemEntity(world, mob.getX(), mob.getY() + 0.5, mob.getZ(), drop));
+                    }
+                }
+
                 mob.damage(world.getDamageSources().playerAttack(player), 9999.0f);
             }
         } else {

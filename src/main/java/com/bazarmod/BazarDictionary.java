@@ -25,9 +25,13 @@ public class BazarDictionary {
             String mobTypeKey,
             String mobStreetNickname,
             List<String> mobDissLines,
-            List<String> words
+            List<String> words,
+            String bossTag
     ) {}
 
+    private record BossProfile(String nickname, String badge, List<List<String>> disses, List<String> words) {}
+
+    private static final Map<String, BossProfile> BOSS_PROFILES = new HashMap<>();
     private static final Map<String, String> MOB_NICKNAMES = new HashMap<>();
     private static final Map<String, List<List<String>>> MOB_DISSES = new HashMap<>();
     private static final Map<Integer, String> TIER_BADGES = new HashMap<>();
@@ -46,6 +50,21 @@ public class BazarDictionary {
                 return;
             }
             JsonObject root = new Gson().fromJson(new InputStreamReader(is, StandardCharsets.UTF_8), JsonObject.class);
+
+            if (root.has("boss_specific")) {
+                JsonObject bossSpec = root.getAsJsonObject("boss_specific");
+                for (Map.Entry<String, JsonElement> entry : bossSpec.entrySet()) {
+                    JsonObject obj = entry.getValue().getAsJsonObject();
+                    String nick = obj.has("nickname") ? obj.get("nickname").getAsString() : "Босс Точки";
+                    String badge = obj.has("badge") ? obj.get("badge").getAsString() : "БОСС ТОЧКИ";
+                    List<List<String>> disses = obj.has("disses") ? parseDissList(obj.getAsJsonArray("disses")) : List.of();
+                    List<String> words = new ArrayList<>();
+                    if (obj.has("words")) {
+                        obj.getAsJsonArray("words").forEach(w -> words.add(w.getAsString()));
+                    }
+                    BOSS_PROFILES.put(entry.getKey(), new BossProfile(nick, badge, disses, words));
+                }
+            }
 
             if (root.has("mob_specific")) {
                 JsonObject mobSpec = root.getAsJsonObject("mob_specific");
@@ -92,7 +111,19 @@ public class BazarDictionary {
         return result;
     }
 
+    public static String getSpotBossTag(LivingEntity entity) {
+        for (String tag : entity.getCommandTags()) {
+            if (tag.startsWith("bazar_boss_")) {
+                return tag;
+            }
+        }
+        return null;
+    }
+
     public static int resolveTier(LivingEntity entity) {
+        if (getSpotBossTag(entity) != null) {
+            return 3;
+        }
         if (entity instanceof EnderDragonEntity || entity instanceof WitherEntity
                 || entity instanceof WardenEntity || entity instanceof ElderGuardianEntity) {
             return 4;
@@ -115,9 +146,24 @@ public class BazarDictionary {
     public static PromptBundle generateFor(LivingEntity entity, int mobWinsCount) {
         ensureLoaded();
         int tier = resolveTier(entity);
-
         Identifier typeId = Registries.ENTITY_TYPE.getId(entity.getType());
         String pathKey = typeId.getPath();
+
+        // Check if this is a special structure boss (Padik, Beer Kiosk, Garage)
+        String bossTag = getSpotBossTag(entity);
+        if (bossTag != null && BOSS_PROFILES.containsKey(bossTag)) {
+            BossProfile bp = BOSS_PROFILES.get(bossTag);
+            List<List<String>> pool = bp.disses().isEmpty()
+                    ? List.of(List.of("Поясни за свой визит на мою точку, фраер!"))
+                    : bp.disses();
+            int idx = pickNonRepeatingIndex(bossTag, pool.size());
+            List<String> chosenDiss = new ArrayList<>(pool.get(idx));
+
+            List<String> wordPool = new ArrayList<>(bp.words());
+            Collections.shuffle(wordPool, RANDOM);
+            List<String> chosenWords = new ArrayList<>(wordPool.subList(0, Math.min(5, wordPool.size())));
+            return new PromptBundle(tier, bp.badge(), bossTag, bp.nickname(), chosenDiss, chosenWords, bossTag);
+        }
 
         String nickname = entity.hasCustomName() && entity.getCustomName() != null
                 ? entity.getCustomName().getString()
@@ -147,7 +193,7 @@ public class BazarDictionary {
 
         int wordCount = Math.min(wordPool.size(), 2 + tier + Math.min(2, mobWinsCount));
         List<String> chosenWords = new ArrayList<>(wordPool.subList(0, wordCount));
-        return new PromptBundle(tier, tierBadge, pathKey, nickname, chosenDiss, chosenWords);
+        return new PromptBundle(tier, tierBadge, pathKey, nickname, chosenDiss, chosenWords, null);
     }
 
     private static int pickNonRepeatingIndex(String key, int poolSize) {

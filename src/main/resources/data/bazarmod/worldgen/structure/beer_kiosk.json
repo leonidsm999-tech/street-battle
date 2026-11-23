@@ -1,0 +1,6 @@
+{
+  "type": "bazarmod:beer_kiosk",
+  "biomes": "#bazarmod:has_bazar_spots",
+  "step": "surface_structures",
+  "spawn_overrides": {}
+}

@@ -1,0 +1,6 @@
+{
+  "type": "bazarmod:padik",
+  "biomes": "#bazarmod:has_bazar_spots",
+  "step": "surface_structures",
+  "spawn_overrides": {}
+}

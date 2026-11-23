@@ -1,0 +1,22 @@
+{
+  "structures": [
+    {
+      "structure": "bazarmod:padik",
+      "weight": 1
+    },
+    {
+      "structure": "bazarmod:beer_kiosk",
+      "weight": 1
+    },
+    {
+      "structure": "bazarmod:garage",
+      "weight": 1
+    }
+  ],
+  "placement": {
+    "type": "minecraft:random_spread",
+    "salt": 1488228,
+    "spacing": 22,
+    "separation": 8
+  }
+}

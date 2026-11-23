@@ -1,0 +1,6 @@
+{
+  "type": "bazarmod:garage",
+  "biomes": "#bazarmod:has_bazar_spots",
+  "step": "surface_structures",
+  "spawn_overrides": {}
+}

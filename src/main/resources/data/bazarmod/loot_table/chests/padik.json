@@ -1,0 +1,73 @@
+{
+  "type": "minecraft:chest",
+  "pools": [
+    {
+      "rolls": { "type": "minecraft:uniform", "min": 3, "max": 5 },
+      "entries": [
+        {
+          "type": "minecraft:item",
+          "name": "minecraft:emerald",
+          "weight": 6,
+          "functions": [
+            { "function": "minecraft:set_count", "count": { "type": "minecraft:uniform", "min": 2, "max": 6 } }
+          ]
+        },
+        {
+          "type": "minecraft:item",
+          "name": "minecraft:golden_apple",
+          "weight": 3,
+          "functions": [
+            { "function": "minecraft:set_count", "count": { "type": "minecraft:uniform", "min": 1, "max": 2 } }
+          ]
+        },
+        {
+          "type": "minecraft:item",
+          "name": "minecraft:pumpkin_seeds",
+          "weight": 4,
+          "functions": [
+            { "function": "minecraft:set_count", "count": { "type": "minecraft:uniform", "min": 8, "max": 16 } }
+          ]
+        }
+      ]
+    },
+    {
+      "rolls": { "type": "minecraft:uniform", "min": 2, "max": 4 },
+      "entries": [
+        {
+          "type": "minecraft:item",
+          "name": "psychedelicraft:cigarette",
+          "weight": 6,
+          "functions": [
+            { "function": "minecraft:set_count", "count": { "type": "minecraft:uniform", "min": 4, "max": 12 } }
+          ]
+        },
+        {
+          "type": "minecraft:item",
+          "name": "psychedelicraft:joint",
+          "weight": 5,
+          "functions": [
+            { "function": "minecraft:set_count", "count": { "type": "minecraft:uniform", "min": 2, "max": 6 } }
+          ]
+        },
+        {
+          "type": "minecraft:item",
+          "name": "psychedelicraft:wooden_mug",
+          "weight": 4,
+          "functions": [
+            { "function": "minecraft:set_count", "count": 1 },
+            {
+              "function": "minecraft:set_components",
+              "components": {
+                "psychedelicraft:fluids": {
+                  "amount": 40500,
+                  "fluid": "psychedelicraft:wheat_hop",
+                  "attributes": { "fermentation": 2, "maturation": 2 }
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
