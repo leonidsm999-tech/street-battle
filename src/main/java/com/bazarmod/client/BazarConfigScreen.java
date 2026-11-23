@@ -159,7 +159,7 @@ public class BazarConfigScreen extends Screen {
     private void saveAndClose() {
         BazarConfig cfg = BazarConfig.get();
         cfg.apiKey = this.apiKeyField.getText().trim();
-        cfg.model = this.modelField.getText().trim().isEmpty() ? "gemini-2.5-flash" : this.modelField.getText().trim();
+        cfg.model = this.modelField.getText().trim().isEmpty() ? "gemini-3.8-flash" : this.modelField.getText().trim();
         cfg.proxyHost = this.proxyHostField.getText().trim();
         cfg.proxyPort = parseSafeInt(this.proxyPortField.getText(), 0, 0, 65535);
         cfg.battleDurationSec = parseSafeInt(this.durationField.getText(), 15, 5, 30);

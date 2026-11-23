@@ -9,7 +9,7 @@ import java.util.Properties;
 
 public class BazarConfig {
     public String apiKey = "";
-    public String model = "gemini-2.5-flash";
+    public String model = "gemini-3.8-flash";
     public String proxyHost = "";
     public int proxyPort = 0;
     public int battleDurationSec = 15;
@@ -47,7 +47,7 @@ public class BazarConfig {
             try (Reader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
                 props.load(reader);
                 cfg.apiKey = props.getProperty("api_key", "").trim();
-                cfg.model = props.getProperty("model", "gemini-2.5-flash").trim();
+                cfg.model = props.getProperty("model", "gemini-3.8-flash").trim();
                 cfg.proxyHost = props.getProperty("proxy_host", "").trim();
                 cfg.proxyPort = parseInt(props.getProperty("proxy_port", "0"), 0);
                 cfg.battleDurationSec = Math.max(5, Math.min(30, parseInt(props.getProperty("battle_duration_sec", "15"), 15)));
@@ -74,8 +74,8 @@ public class BazarConfig {
                 "# Вставьте ваш бесплатный API ключ из Google AI Studio (https://aistudio.google.com/)",
                 "api_key=" + (apiKey == null ? "" : apiKey.trim()),
                 "",
-                "# Модель Gemini (рекомендуется gemini-2.5-flash)",
-                "model=" + (model == null || model.isBlank() ? "gemini-2.5-flash" : model.trim()),
+                "# Модель Gemini (рекомендуется gemini-3.8-flash)",
+                "model=" + (model == null || model.isBlank() ? "gemini-3.8-flash" : model.trim()),
                 "",
                 "# Опционально: HTTP прокси, если Gemini API недоступен напрямую (например 127.0.0.1 и 10809)",
                 "proxy_host=" + (proxyHost == null ? "" : proxyHost.trim()),

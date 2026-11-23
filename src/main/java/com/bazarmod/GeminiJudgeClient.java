@@ -27,7 +27,7 @@ public class GeminiJudgeClient {
     public record ConnectionTestResult(boolean ok, String message) {}
 
     private static final Gson GSON = new Gson();
-    private static final String STABLE_FALLBACK_MODEL = "gemini-2.5-flash";
+    private static final String STABLE_FALLBACK_MODEL = "gemini-3.8-flash";
 
     private static volatile HttpClient cachedClient = null;
     private static volatile String cachedProxySignature = "";
@@ -100,7 +100,7 @@ public class GeminiJudgeClient {
                     BazarMod.LOGGER.warn("Gemini API returned {} on model {} (attempt {}/{}), retrying...",
                             response.statusCode(), currentModel, attempt, maxAttempts);
 
-                    // If a preview model is overloaded (503) on the last retry, fall back to stable gemini-2.5-flash
+                    // If a preview model is overloaded (503) on the last retry, fall back to stable gemini-3.8-flash
                     if (response.statusCode() == 503 && attempt == maxAttempts - 1 && !STABLE_FALLBACK_MODEL.equals(currentModel)) {
                         BazarMod.LOGGER.info("Switching fallback attempt to stable model: {}", STABLE_FALLBACK_MODEL);
                         currentModel = STABLE_FALLBACK_MODEL;
